@@ -924,7 +924,26 @@ func (sdb *IntraBlockState) CommitBlock(chainRules *chain.Rules, stateWriter Sta
 			sdb.getStateObject(addr)
 		}
 	}
-	return sdb.MakeWriteSet(chainRules, stateWriter)
+	
+	// Commit state changes to the primary state writer
+	err := sdb.MakeWriteSet(chainRules, stateWriter)
+	if err != nil {
+		return err
+	}
+	
+	// If Redis is enabled, make sure we also write the state to Redis
+	if IsRedisEnabled() && sdb.currentBlock > 0 {
+		if redisWriter := GetRedisStateWriter(sdb.currentBlock); redisWriter != nil {
+			// Commit state to Redis separately
+			if err := sdb.MakeWriteSet(chainRules, redisWriter); err != nil {
+				// Log the error but don't fail the block
+				logger := log.Root()
+				logger.Warn("Failed to commit block state to Redis", "err", err, "block", sdb.currentBlock)
+			}
+		}
+	}
+	
+	return nil
 }
 
 func (sdb *IntraBlockState) BalanceIncreaseSet() map[libcommon.Address]uint256.Int {

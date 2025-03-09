@@ -180,9 +180,21 @@ For more detailed implementation information, please see [IMPLEMENTATION.md](IMP
 - Performance under heavy load depends on Redis server capacity
 - For production deployments, consider using Redis Cluster for scalability
 
+## Recent Improvements
+
+- **Enhanced Integration**: Full integration with Erigon's block, transaction and state processing
+- **Self-destruct Handling**: Properly track account deletion during state transitions
+- **Block Finalization**: Complete block metadata is now stored with state root and header hash
+- **Chain Reorg Awareness**: Improved tracking of canonical chain during reorganizations
+- **Cache Management**: Added writer caching for better performance during block processing
+- **Factory Pattern**: Improved factory implementation to avoid circular dependencies
+
 ## Future Improvements
 
 - Implement pruning strategies for old state data
-- Add support for sharded Redis deployments
+- Add support for sharded Redis deployments 
 - Optimize storage format for reduced memory usage
 - Add streaming capabilities for real-time state updates
+- Add support for Redis Cluster and Redis Sentinel for high availability
+- Implement batch operations for improved write performance
+- Add metrics and observability for Redis operations

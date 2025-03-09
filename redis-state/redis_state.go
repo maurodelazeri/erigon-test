@@ -262,6 +262,60 @@ func (w *RedisHistoricalWriter) WriteHistory() error {
 	return nil
 }
 
+// StoreBlockInfo stores block header information in Redis
+func (w *RedisHistoricalWriter) StoreBlockInfo(headerInterface interface{}, root libcommon.Hash) error {
+	// Extract relevant header information
+	headerJSON, err := json.Marshal(headerInterface)
+	if err != nil {
+		return fmt.Errorf("failed to marshal block header: %w", err)
+	}
+	
+	// Get header hash if available
+	var headerHash string
+	if header, ok := headerInterface.(interface{ Hash() libcommon.Hash }); ok {
+		headerHash = header.Hash().Hex()
+	}
+	
+	ctx, cancel := context.WithTimeout(w.ctx, 5*time.Second)
+	defer cancel()
+	
+	// Store block information
+	blockKey := fmt.Sprintf("block:%d", w.blockNum)
+	
+	// Create a block data structure with current information
+	blockData := map[string]interface{}{
+		"number":     w.blockNum,
+		"timestamp":  time.Now().Unix(),
+		"header":     string(headerJSON),
+		"stateRoot":  root.Hex(),
+		"headerHash": headerHash,
+	}
+	
+	if headerHash != "" {
+		// Store hash to block number mapping
+		blockHashKey := fmt.Sprintf("blockHash:%s", headerHash)
+		err = w.client.HSet(ctx, blockHashKey, map[string]interface{}{
+			"number":    w.blockNum,
+			"timestamp": time.Now().Unix(),
+		}).Err()
+		
+		if err != nil {
+			return fmt.Errorf("failed to store block hash mapping: %w", err)
+		}
+		
+		// Also set hash field in the block entry
+		blockData["hash"] = headerHash
+	}
+	
+	// Store actual block data
+	err = w.client.HSet(ctx, blockKey, blockData).Err()
+	if err != nil {
+		return fmt.Errorf("failed to store block data: %w", err)
+	}
+	
+	return nil
+}
+
 // accountKey creates the Redis key for an account
 func accountKey(address libcommon.Address) string {
 	return fmt.Sprintf("account:%s", address.Hex())

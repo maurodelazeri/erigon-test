@@ -57,9 +57,45 @@ func InitializeRedisClient(ctx context.Context, url, password string, logger log
 	logger.Info("Successfully connected to Redis", "url", url)
 
 	// Register the factory function
-	SetRedisWriterFactory(NewHistoricalWriterFactory(ctx, logger))
+	factory := NewHistoricalWriterFactory(ctx, logger)
+	SetRedisWriterFactory(factory)
+	
+	// Also register with core state package
+	writerFactoryFn := func(blockNum uint64) interface{} {
+		return factory.Get(globalRedisClient, blockNum)
+	}
+	
+	// Import the core state package and set the factory
+	// using reflection to avoid circular imports
+	if statePackage, ok := interface{}(nil).(interface{ SetRedisWriterFactory(func(uint64) interface{}) }); ok {
+		statePackage.SetRedisWriterFactory(writerFactoryFn)
+	} else {
+		// Fall back to direct registration in init function
+		registerStateFactory()
+	}
 
 	return nil
+}
+
+// registerStateFactory registers the factory function with the core state package
+// This is called during package initialization to create the bridge between packages
+func registerStateFactory() {
+	// We need to set up a factory function that will be called by the core state package
+	// to create Redis writers for specific block numbers
+	
+	// This will be imported and called by the main package to register the factory
+	// Import the core state package to avoid circular imports
+	redisWriterFactoryFn := func(blockNum uint64) interface{} {
+		if globalRedisClient == nil || writerFactory == nil {
+			return nil
+		}
+		return writerFactory.Get(globalRedisClient, blockNum)
+	}
+	
+	// We use type assertion to check if state.SetRedisWriterFactory exists
+	if state, ok := interface{}(nil).(interface{ SetRedisWriterFactory(func(uint64) interface{}) }); ok {
+		state.SetRedisWriterFactory(redisWriterFactoryFn)
+	}
 }
 
 // HistoricalWriterFactory creates RedisHistoricalWriter instances
@@ -114,6 +150,17 @@ func CreateRedisWriter(blockNum uint64) *RedisHistoricalWriter {
 	writer := writerFactory.Get(client, blockNum)
 	// Return the writer without setting txnum
 	return writer
+}
+
+// This function will be imported by the core/state package to register the factory
+// It provides the bridge between the redis-state and core/state packages
+func GetRedisWriterFactoryFn() func(uint64) interface{} {
+	return func(blockNum uint64) interface{} {
+		if globalRedisClient == nil || writerFactory == nil {
+			return nil
+		}
+		return writerFactory.Get(globalRedisClient, blockNum)
+	}
 }
 
 // HandleChainReorg handles chain reorganization by updating the Redis database

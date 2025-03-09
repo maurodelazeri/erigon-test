@@ -23,7 +23,11 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"github.com/erigontech/erigon-lib/log/v3"
+	libcommon "github.com/erigontech/erigon-lib/common"
 )
+
+// redisWriterFactory is a function type for creating Redis writers
+type redisWriterFactory func(blockNum uint64) RedisWriter
 
 // RedisWriter interface represents a redis writer that can be used to sync state
 type RedisWriter interface {
@@ -40,6 +44,7 @@ type RedisHistoricalWriter interface {
 	WriteHistory() error
 	WriteBlockStart(blockNum uint64) error
 	HandleTransaction(tx interface{}, receipt interface{}, blockNum uint64, txIndex uint64) error
+	StoreBlockInfo(header interface{}, root libcommon.Hash) error
 }
 
 var (
@@ -48,7 +53,18 @@ var (
 	redisStateWriter     StateWriter
 	redisHistoryWriter   RedisWriter
 	redisIntegrationOnce sync.Once
+	
+	// Factory function to create Redis writers - will be set by the redis-state package
+	redisWriterFactoryFn redisWriterFactory
+	
+	// Instance cache to avoid creating new instances for the same block
+	redisWriterCache     map[uint64]RedisWriter
+	redisWriterCacheMux  sync.RWMutex
 )
+
+func init() {
+	redisWriterCache = make(map[uint64]RedisWriter)
+}
 
 // InitializeRedisClient initializes the Redis client with the provided connection parameters
 func InitializeRedisClient(ctx context.Context, url, password string, logger log.Logger) error {
@@ -81,24 +97,73 @@ func InitializeRedisClient(ctx context.Context, url, password string, logger log
 	return err
 }
 
-// GetRedisStateWriter returns a RedisWriter for the current block number or creates a new one if not initialized
-func GetRedisStateWriter(blockNum uint64) RedisWriter {
-	if redisClient == nil {
-		return nil
+// SetRedisWriterFactory sets the factory function for creating Redis writers
+func SetRedisWriterFactory(factory interface{}) {
+	// Accept either our internal type or a more generic factory function from redis-state
+	if typedFactory, ok := factory.(redisWriterFactory); ok {
+		redisWriterFactoryFn = typedFactory
+	} else if fn, ok := factory.(func(uint64) interface{}); ok {
+		// Bridge from redis-state package
+		redisWriterFactoryFn = func(blockNum uint64) RedisWriter {
+			writer := fn(blockNum)
+			if writer == nil {
+				return nil
+			}
+			
+			// Try to cast to RedisWriter
+			if redisWriter, ok := writer.(RedisWriter); ok {
+				return redisWriter
+			}
+			
+			return nil
+		}
 	}
-
-	// We'll initialize the actual writer through a factory in the redis-state package
-	// to be provided by the main Erigon process, avoiding circular dependencies
-	if redisHistoryWriter == nil || redisHistoryWriter.GetBlockNum() != blockNum {
-		// Need to create a new writer via factory
-		// The factory pattern will be used outside this package to create and set the writer
-		return nil
-	}
-
-	return redisHistoryWriter
 }
 
-// SetRedisStateWriter sets the Redis writer instance
+// GetRedisStateWriter returns a RedisWriter for the given block number or creates a new one
+func GetRedisStateWriter(blockNum uint64) RedisWriter {
+	if !IsRedisEnabled() || redisWriterFactoryFn == nil {
+		return nil
+	}
+
+	// Check cache first with read lock
+	redisWriterCacheMux.RLock()
+	writer, exists := redisWriterCache[blockNum]
+	redisWriterCacheMux.RUnlock()
+	
+	if exists {
+		return writer
+	}
+	
+	// Create new writer with write lock
+	redisWriterCacheMux.Lock()
+	defer redisWriterCacheMux.Unlock()
+	
+	// Double-check pattern
+	if writer, exists = redisWriterCache[blockNum]; exists {
+		return writer
+	}
+	
+	// Call factory method to create writer
+	writer = redisWriterFactoryFn(blockNum)
+	if writer != nil {
+		redisWriterCache[blockNum] = writer
+	}
+	
+	return writer
+}
+
+// ClearRedisWriterCache clears the Redis writer cache
+func ClearRedisWriterCache() {
+	redisWriterCacheMux.Lock()
+	defer redisWriterCacheMux.Unlock()
+	
+	// Clear cache
+	redisWriterCache = make(map[uint64]RedisWriter)
+}
+
+// SetRedisStateWriter sets the Redis writer instance directly
+// Used primarily for testing
 func SetRedisStateWriter(writer RedisWriter) {
 	redisHistoryWriter = writer
 }
@@ -111,4 +176,15 @@ func IsRedisEnabled() bool {
 // GetRedisClient returns the Redis client
 func GetRedisClient() *redis.Client {
 	return redisClient
+}
+
+// ShutdownRedis properly closes the Redis client connection
+func ShutdownRedis() {
+	if redisClient != nil {
+		redisClient.Close()
+		redisClient = nil
+	}
+	
+	// Clear cache
+	ClearRedisWriterCache()
 }

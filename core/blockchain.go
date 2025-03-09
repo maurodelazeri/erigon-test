@@ -357,6 +357,11 @@ func FinalizeBlockExecution(
 	if state.IsRedisEnabled() {
 		if redisWriter := state.GetRedisStateWriter(header.Number.Uint64()); redisWriter != nil {
 			if redisHistoryWriter, ok := redisWriter.(state.RedisHistoricalWriter); ok {
+				// Store block header and state root information
+				if err := redisHistoryWriter.StoreBlockInfo(header, header.Root); err != nil {
+					logger.Warn("Failed to store block info in Redis", "err", err, "block", header.Number.Uint64())
+				}
+				
 				// Write change sets to Redis
 				if err := redisHistoryWriter.WriteChangeSets(); err != nil {
 					logger.Warn("Failed to write Redis change sets", "err", err, "block", header.Number.Uint64())
