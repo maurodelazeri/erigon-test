@@ -31,6 +31,7 @@ import (
 	"github.com/erigontech/erigon-lib/log/v3"
 	"github.com/erigontech/erigon-lib/types/accounts"
 	"github.com/erigontech/erigon/core/state"
+	"github.com/erigontech/erigon/core/types"
 )
 
 // RedisStateReader implements the state.StateReader interface using Redis as the backing store
@@ -125,6 +126,11 @@ func NewRedisHistoricalWriter(client *redis.Client, blockNum uint64) *RedisHisto
 	}
 }
 
+// GetBlockNum returns the block number for this writer
+func (w *RedisHistoricalWriter) GetBlockNum() uint64 {
+	return w.blockNum
+}
+
 // SetTxNum sets the current transaction number being processed
 func (w *RedisStateWriter) SetTxNum(txNum uint64) {
 	w.txNum = txNum
@@ -145,13 +151,74 @@ func (w *RedisStateWriter) DirectTestWrite(key string, value string) error {
 
 // WriteChangeSets writes change sets to Redis
 func (w *RedisHistoricalWriter) WriteChangeSets() error {
-	// No-op for Redis implementation as changes are written immediately
+	// For Redis implementation, most changes are written immediately
+	// However, we need to update canonical chain information to handle reorgs properly
+
+	// If this is a normal block (not a reorg marker)
+	if w.txNum != 0 {
+		ctx, cancel := context.WithTimeout(w.ctx, 5*time.Second)
+		defer cancel()
+
+		// Update the canonical chain information
+		canonicalKey := "canonicalChain"
+		blockHashKey := fmt.Sprintf("block:%d", w.blockNum)
+
+		// Get the block hash
+		blockHash, err := w.client.HGet(ctx, blockHashKey, "hash").Result()
+		if err != nil && err != redis.Nil {
+			return fmt.Errorf("failed to get block hash for block %d: %w", w.blockNum, err)
+		}
+
+		if blockHash != "" {
+			// Add this block/hash pair to the canonical chain
+			err = w.client.ZAdd(ctx, canonicalKey, redis.Z{
+				Score:  float64(w.blockNum),
+				Member: blockHash,
+			}).Err()
+
+			if err != nil {
+				return fmt.Errorf("failed to update canonical chain: %w", err)
+			}
+
+			// Update the hash entry to mark it as canonical
+			hashKey := fmt.Sprintf("blockHash:%s", blockHash)
+			err = w.client.HSet(ctx, hashKey, "canonical", true).Err()
+			if err != nil {
+				return fmt.Errorf("failed to mark block as canonical: %w", err)
+			}
+
+			// Update the current block pointer
+			err = w.client.Set(ctx, "currentBlock", w.blockNum, 0).Err()
+			if err != nil {
+				return fmt.Errorf("failed to update current block: %w", err)
+			}
+		}
+	}
+
 	return nil
 }
 
 // WriteHistory writes history to Redis
 func (w *RedisHistoricalWriter) WriteHistory() error {
-	// No-op for Redis implementation as all changes are stored with block numbers
+	// For Redis implementation, we want to handle specifically marked blocks
+	// txNum == 0 is a special marker for blocks that have been reorged out
+	// or need special handling
+
+	if w.txNum == 0 {
+		// This is a block that has been reorged out
+		// We could add extra handling here, e.g. marking keys as invalid
+		// or implementing a pruning policy
+		ctx, cancel := context.WithTimeout(w.ctx, 5*time.Second)
+		defer cancel()
+
+		// We could add a record to a special key to track reorgs
+		reorgKey := fmt.Sprintf("reorg:%d", w.blockNum)
+		err := w.client.Set(ctx, reorgKey, time.Now().Format(time.RFC3339), 30*24*time.Hour).Err()
+		if err != nil {
+			return fmt.Errorf("error recording reorg marker: %w", err)
+		}
+	}
+
 	return nil
 }
 
@@ -407,6 +474,133 @@ func (w *RedisStateWriter) UpdateAccountCode(address libcommon.Address, incarnat
 	if setCmd.Err() != nil {
 		return fmt.Errorf("redis error storing code for hash %s: %w",
 			codeHash.Hex(), setCmd.Err())
+	}
+
+	return nil
+}
+
+// HandleTransaction stores transaction data in Redis
+func (w *RedisStateWriter) HandleTransaction(tx types.Transaction, receipt *types.Receipt, blockNum uint64, txIndex uint64) error {
+	ctx, cancel := context.WithTimeout(w.ctx, 5*time.Second)
+	defer cancel()
+
+	// Serialize the transaction to JSON
+	txHash := tx.Hash()
+	txData, err := json.Marshal(tx)
+	if err != nil {
+		return fmt.Errorf("failed to marshal transaction %s: %w", txHash.Hex(), err)
+	}
+
+	// Store the transaction with block number as score
+	txKey := fmt.Sprintf("tx:%s", txHash.Hex())
+	err = w.client.ZAdd(ctx, txKey, redis.Z{
+		Score:  float64(blockNum),
+		Member: string(txData),
+	}).Err()
+	if err != nil {
+		return fmt.Errorf("redis error storing transaction %s: %w", txHash.Hex(), err)
+	}
+
+	// Add transaction to block's transaction list
+	blockTxsKey := fmt.Sprintf("block:%d:txs", blockNum)
+	err = w.client.SAdd(ctx, blockTxsKey, txHash.Hex()).Err()
+	if err != nil {
+		return fmt.Errorf("redis error adding transaction to block: %w", err)
+	}
+
+	// Set transaction sender
+	sender, ok := tx.GetSender()
+	if ok {
+		// Add transaction to sender's transaction list
+		senderTxsKey := fmt.Sprintf("sender:%s:txs", sender.Hex())
+		err = w.client.ZAdd(ctx, senderTxsKey, redis.Z{
+			Score:  float64(blockNum),
+			Member: txHash.Hex(),
+		}).Err()
+		if err != nil {
+			return fmt.Errorf("redis error adding transaction to sender: %w", err)
+		}
+	}
+
+	// If we have a receipt, store it as well
+	if receipt != nil {
+		err = w.StoreReceipt(txHash, receipt, blockNum, txIndex)
+		if err != nil {
+			return fmt.Errorf("failed to store receipt for transaction %s: %w", txHash.Hex(), err)
+		}
+	}
+
+	return nil
+}
+
+// StoreReceipt stores a transaction receipt in Redis
+func (w *RedisStateWriter) StoreReceipt(txHash libcommon.Hash, receipt *types.Receipt, blockNum uint64, txIndex uint64) error {
+	ctx, cancel := context.WithTimeout(w.ctx, 5*time.Second)
+	defer cancel()
+
+	// Serialize the receipt to JSON
+	receiptData, err := json.Marshal(receipt)
+	if err != nil {
+		return fmt.Errorf("failed to marshal receipt for transaction %s: %w", txHash.Hex(), err)
+	}
+
+	// Store the receipt with block number as score
+	receiptKey := fmt.Sprintf("receipt:%s", txHash.Hex())
+	err = w.client.ZAdd(ctx, receiptKey, redis.Z{
+		Score:  float64(blockNum),
+		Member: string(receiptData),
+	}).Err()
+	if err != nil {
+		return fmt.Errorf("redis error storing receipt for transaction %s: %w", txHash.Hex(), err)
+	}
+
+	// Add receipt to block's receipts list
+	blockReceiptsKey := fmt.Sprintf("block:%d:receipts", blockNum)
+	err = w.client.ZAdd(ctx, blockReceiptsKey, redis.Z{
+		Score:  float64(txIndex),
+		Member: txHash.Hex(),
+	}).Err()
+	if err != nil {
+		return fmt.Errorf("redis error adding receipt to block: %w", err)
+	}
+
+	// For each log, store it in the logs by topic index
+	for _, log := range receipt.Logs {
+		// Store log by its index
+		logKey := fmt.Sprintf("log:%d", log.Index)
+		logData, err := json.Marshal(log)
+		if err != nil {
+			w.logger.Warn("Failed to marshal log", "log", log.Index, "err", err)
+			continue
+		}
+
+		err = w.client.Set(ctx, logKey, logData, 0).Err()
+		if err != nil {
+			w.logger.Warn("Failed to store log", "log", log.Index, "err", err)
+			continue
+		}
+
+		// Index logs by topic
+		for _, topic := range log.Topics {
+			topicKey := fmt.Sprintf("topic:%s", topic.Hex())
+			err = w.client.ZAdd(ctx, topicKey, redis.Z{
+				Score:  float64(blockNum),
+				Member: fmt.Sprintf("%d", log.Index),
+			}).Err()
+			if err != nil {
+				w.logger.Warn("Failed to index log by topic", "topic", topic.Hex(), "err", err)
+			}
+		}
+
+		// Index logs by address
+		addressKey := fmt.Sprintf("address:%s:logs", log.Address.Hex())
+		err = w.client.ZAdd(ctx, addressKey, redis.Z{
+			Score:  float64(blockNum),
+			Member: fmt.Sprintf("%d", log.Index),
+		}).Err()
+		if err != nil {
+			w.logger.Warn("Failed to index log by address", "address", log.Address.Hex(), "err", err)
+		}
 	}
 
 	return nil

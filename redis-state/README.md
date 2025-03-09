@@ -1,8 +1,14 @@
-# Redis State for Erigon: Achieving O(1) Historical State Access
+# Redis State Integration for Erigon
 
-## The Core Concept
+This module implements integration between Erigon and Redis for state persistence. It allows Erigon to write blockchain state to Redis in parallel with its normal database writes, providing O(1) access to any historical state.
 
-Redis State for Erigon provides instant, constant-time (O(1)) access to any historical Ethereum state data, regardless of how old the data is or how large the blockchain has grown.
+## Overview
+
+The Redis state integration enables several use cases:
+- Maintaining a secondary copy of the blockchain state for redundancy
+- Exposing blockchain state through a Redis interface for external applications
+- Supporting custom analytical applications with live state updates
+- Allowing blockchain explorers to access state without direct Erigon API access
 
 ## How O(1) Access Works with Redis
 
@@ -11,6 +17,62 @@ The key innovation is using Redis sorted sets to store state changes with block 
 1. **Constant-Time Lookups**: Finding the state at any block takes the same amount of time, whether it's yesterday's block or from years ago
 2. **No Chain Traversal**: Traditional systems need to replay or traverse the chain; ours doesn't
 3. **Efficient Storage**: We only store states when they change, not for every block
+
+## Configuration
+
+To enable Redis state persistence, use the following command line flags:
+
+```
+--redis.enabled             Enable Redis state persistence (default: false)
+--redis.url                 Redis connection URL (default: "redis://localhost:6379/0")
+--redis.password            Redis password (default: "")
+```
+
+## Architecture
+
+The Redis state integration uses a factory pattern to avoid circular dependencies between packages. The main components are:
+
+1. **RedisStateReader**: Reads state from Redis at the latest block or a specific historical block
+2. **RedisStateWriter**: Writes state changes to Redis
+3. **RedisHistoricalWriter**: Extends RedisStateWriter with history awareness
+4. **RedisStateProvider**: Implements provider interfaces for Erigon's RPC API
+
+## Data Model
+
+State data is stored in Redis using the following key patterns:
+
+### Account and State Data
+- `account:{address}` - Account data (sorted set with block numbers as scores)
+- `storage:{address}:{key}` - Storage data (sorted set with block numbers as scores)
+- `code:{codehash}` - Contract code
+
+### Block Data
+- `block:{number}` - Block data
+- `blockHash:{hash}` - Mapping from block hash to block number
+- `canonicalChain` - Sorted set of canonical block hashes with block numbers as scores
+- `currentBlock` - Latest block number
+- `reorg:{blockNum}` - Marker for blocks that were part of a chain reorganization
+
+### Transaction and Receipt Data
+- `tx:{hash}` - Transaction data (sorted set with block numbers as scores)
+- `block:{number}:txs` - Set of transaction hashes in a block
+- `sender:{address}:txs` - Transactions sent by an address (sorted set with block numbers as scores)
+- `receipt:{hash}` - Receipt data (sorted set with block numbers as scores)
+- `block:{number}:receipts` - Ordered list of receipts in a block (sorted set with tx indices as scores)
+
+### Event Logs
+- `log:{index}` - Log data
+- `topic:{hash}` - Logs by topic (sorted set with block numbers as scores)
+- `address:{address}:logs` - Logs by emitting address (sorted set with block numbers as scores)
+
+## Chain Reorganization Handling
+
+The Redis state integration handles chain reorganizations (reorgs) by:
+
+1. Detecting when blocks are unwound during a reorg
+2. Marking reorged blocks with special markers
+3. Tracking the canonical chain to distinguish between canonical and non-canonical blocks
+4. Providing accurate historical state access even after reorgs
 
 ## Practical Example
 
@@ -26,64 +88,101 @@ Block 450:  Balance changed to 7.5 ETH
 Block 3000: Balance changed to 10 ETH
 ```
 
-### Traditional Approach (Without Redis State)
+When querying for the balance at block 2000, our Redis State system:
 
-To get the account balance at block 2000, a traditional node would:
+1. Uses `ZREVRANGEBYSCORE` to get the most recent state change ≤ block 2000
+2. Immediately retrieves the value from block 450 (7.5 ETH) in a single operation
+3. Performance remains constant regardless of chain size (O(1) complexity)
 
-1. Start from the genesis state
-2. Replay all transactions that affect this account up to block 2000
-3. Calculate the final state at block 2000
-4. Performance worsens as the chain grows (O(n) complexity)
+## Usage Examples
 
-### Redis State Approach
+### Accessing Account State
 
-Our Redis State system:
+```go
+package main
 
-1. Stores each state change in a sorted set, using block numbers as scores
-2. When querying block 2000, it uses `ZREVRANGEBYSCORE` to get the most recent state change ≤ block 2000
-3. Immediately retrieves the value from block 450 (7.5 ETH) in a single operation
-4. Performance remains constant regardless of chain size (O(1) complexity)
+import (
+    "context"
+    "fmt"
+    "log"
 
-## Real-World Benefits
+    "github.com/erigontech/erigon-lib/common"
+    "github.com/erigontech/erigon/redis-state"
+    "github.com/redis/go-redis/v9"
+)
 
-This approach delivers significant advantages:
+func main() {
+    // Connect to Redis
+    client := redis.NewClient(&redis.Options{
+        Addr: "localhost:6379",
+    })
 
-- **Querying ancient blocks** (e.g., block 1,000,000 on a chain now at 20,000,000 blocks) takes the same time as recent ones
-- **No performance degradation** as the chain grows
-- **Reduced computational resources** for historical data access
-- **Simplified architecture** for applications that need historical data
+    // Create a state provider
+    provider := redisstate.NewRedisStateProvider(client, log.Default())
 
-## Complete Functionality: Beyond Just State
+    // Get balance of an account
+    address := common.HexToAddress("0x742d35Cc6634C0532925a3b844Bc454e4438f44e")
+    balance, err := provider.BalanceAt(context.Background(), address, -1) // Latest block
+    if err != nil {
+        log.Fatalf("Error getting balance: %v", err)
+    }
 
-To enable full Ethereum API operations like `eth_call`, the Redis system stores more than just account and storage state:
+    fmt.Printf("Balance: %s\n", balance.String())
+}
+```
 
-1. **Block Headers**: Complete block metadata is stored, including timestamps, gas limits, and parent hashes
-2. **Transaction Data**: All transaction details and receipts are mirrored to Redis
-3. **Event Logs**: Log entries emitted by contracts are captured and indexed
+### Accessing Transactions and Receipts
+
+```go
+// Get transaction by hash
+tx, blockHash, blockNum, txIndex, err := provider.GetTransactionByHash(ctx, txHash)
+if err != nil {
+    log.Fatalf("Error getting transaction: %v", err)
+}
+
+// Get receipt for a transaction
+receipt, err := provider.GetTransactionReceipt(ctx, txHash)
+if err != nil {
+    log.Fatalf("Error getting receipt: %v", err)
+}
+
+// Get logs by filter
+filter := &types.LogFilter{
+    FromBlock: rpc.BlockNumber(10000000),
+    ToBlock:   rpc.BlockNumber(10001000),
+    Addresses: []common.Address{contractAddress},
+    Topics:    [][]common.Hash{{eventSignature}},
+}
+logs, err := provider.GetLogs(ctx, filter)
+```
+
+## Complete Functionality
+
+The Redis system stores more than just account and storage state:
+
+1. **Block Headers**: Complete block metadata is stored
+2. **Transaction Data**: All transaction details are mirrored to Redis
+3. **Event Logs**: Log entries emitted by contracts are captured
 4. **Chain Structure**: Block relationships are tracked to handle reorganizations
 
-This comprehensive data model allows the system to:
-
-- Execute simulated contract calls (`eth_call`) at any historical block
-- Provide transaction receipts and their results
-- Support event log queries filtered by address or topic
-- Maintain a complete view of the chain's history
-
-All of this data follows the same O(1) access pattern, ensuring consistent performance regardless of chain height.
-
-## Technical Implementation Insight
-
-While avoiding specific code details, the Redis implementation uses:
-
-1. **Sorted Sets**: Each account or storage slot has its own sorted set
-2. **Block Numbers as Scores**: Each entry's score is the block number when it changed
-3. **ZREVRANGEBYSCORE**: This Redis command retrieves the most recent entry before or at a given block
-4. **State Mirroring**: All state changes from Erigon are captured and written to Redis in real-time
-
-## Storage Optimization
+## Implementation Details
 
 For efficiency, we only store state changes when values actually change:
 
 - If an account balance doesn't change for 10,000 blocks, we only store one entry
 - If a storage slot is modified frequently, we store each unique change
-- The system automatically handles chain reorganizations by tracking block relationships
+
+For more detailed implementation information, please see [IMPLEMENTATION.md](IMPLEMENTATION.md)
+
+## Limitations
+
+- Redis storage can grow large for mainnet deployments - consider using Redis with persistence disabled for ephemeral use cases
+- Performance under heavy load depends on Redis server capacity
+- For production deployments, consider using Redis Cluster for scalability
+
+## Future Improvements
+
+- Implement pruning strategies for old state data
+- Add support for sharded Redis deployments
+- Optimize storage format for reduced memory usage
+- Add streaming capabilities for real-time state updates

@@ -50,6 +50,23 @@ import (
 )
 
 var (
+	// Redis flags for state persistence
+	RedisEnabledFlag = cli.BoolFlag{
+		Name:  "redis.enabled",
+		Usage: "Enable Redis state persistence",
+		Value: false,
+	}
+	RedisURLFlag = cli.StringFlag{
+		Name:  "redis.url",
+		Usage: "Redis connection URL",
+		Value: "redis://localhost:6379/0",
+	}
+	RedisPasswordFlag = cli.StringFlag{
+		Name:  "redis.password",
+		Usage: "Redis password",
+		Value: "",
+	}
+
 	DatabaseVerbosityFlag = cli.IntFlag{
 		Name:  "database.verbosity",
 		Usage: "Enabling internal db logs. Very high verbosity levels may require recompile db. Default: 2, means warning.",
@@ -574,6 +591,11 @@ func setEmbeddedRpcDaemon(ctx *cli.Context, cfg *nodecfg.Config, logger log.Logg
 	if err != nil {
 		utils.Fatalf("Invalid state.cache value provided")
 	}
+	
+	// Set Redis configuration if enabled
+	cfg.Redis.Enabled = ctx.Bool(RedisEnabledFlag.Name)
+	cfg.Redis.URL = ctx.String(RedisURLFlag.Name)
+	cfg.Redis.Password = ctx.String(RedisPasswordFlag.Name)
 
 	/*
 		rootCmd.PersistentFlags().BoolVar(&cfg.GRPCServerEnabled, "grpc", false, "Enable GRPC server")

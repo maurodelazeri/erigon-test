@@ -80,9 +80,10 @@ type IntraBlockState struct {
 	// The refund counter, also used by state transitioning.
 	refund uint64
 
-	txIndex int
-	logs    []types.Logs
-	logSize uint
+	txIndex     int
+	currentBlock uint64 // Current block number being processed (for Redis state)
+	logs        []types.Logs
+	logSize     uint
 
 	// Per-transaction access list
 	accessList *accessList
@@ -113,6 +114,7 @@ func New(stateReader StateReader) *IntraBlockState {
 		transientStorage:  newTransientStorage(),
 		balanceInc:        map[libcommon.Address]*BalanceIncrease{},
 		txIndex:           0,
+		currentBlock:      0,
 		//trace:             true,
 	}
 }
@@ -971,6 +973,12 @@ func (sdb *IntraBlockState) SetTxContext(ti int) {
 		panic(err)
 	}
 	sdb.txIndex = ti
+}
+
+// SetBlockContext sets the current block number being processed
+// This is used for Redis state integration
+func (sdb *IntraBlockState) SetBlockContext(blockNum uint64) {
+	sdb.currentBlock = blockNum
 }
 
 // no not lock

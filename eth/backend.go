@@ -117,6 +117,7 @@ import (
 	"github.com/erigontech/erigon/polygon/bridge"
 	"github.com/erigontech/erigon/polygon/heimdall"
 	polygonsync "github.com/erigontech/erigon/polygon/sync"
+	redisstate "github.com/erigontech/erigon/redis-state"
 	"github.com/erigontech/erigon/rpc"
 	"github.com/erigontech/erigon/turbo/builder"
 	"github.com/erigontech/erigon/turbo/engineapi"
@@ -351,6 +352,17 @@ func New(ctx context.Context, stack *node.Node, config *ethconfig.Config, logger
 	backend.chainDB, err = temporal.New(rawChainDB, agg)
 	if err != nil {
 		return nil, err
+	}
+
+	// Initialize Redis if enabled
+	if stack.Config().Redis.Enabled {
+		logger.Info("Initializing Redis state integration", "url", stack.Config().Redis.URL)
+		if err := redisstate.InitializeRedisClient(context.Background(), stack.Config().Redis.URL, stack.Config().Redis.Password, logger); err != nil {
+			logger.Warn("Failed to initialize Redis client", "err", err)
+			// We don't return error as Redis is optional and shouldn't prevent Erigon from starting
+		} else {
+			logger.Info("Redis state integration initialized successfully")
+		}
 	}
 
 	// Can happen in some configurations

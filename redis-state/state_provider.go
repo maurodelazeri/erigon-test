@@ -126,6 +126,37 @@ func (p *RedisStateProvider) GetRedisClient() *redis.Client {
 	return p.client
 }
 
+// CheckAndHandleReorganization checks if a block was part of a chain reorganization
+// by looking for reorg markers in Redis. Returns true if a reorg was detected.
+func (p *RedisStateProvider) CheckAndHandleReorganization(blockNum uint64) (bool, error) {
+	ctx, cancel := context.WithTimeout(p.ctx, 5*time.Second)
+	defer cancel()
+
+	// Check if there's a reorg marker for this block
+	reorgKey := fmt.Sprintf("reorg:%d", blockNum)
+	exists, err := p.client.Exists(ctx, reorgKey).Result()
+	if err != nil {
+		return false, fmt.Errorf("error checking reorg marker: %w", err)
+	}
+
+	if exists == 1 {
+		// This block was marked as part of a reorg
+		p.logger.Info("Detected block from reorganized chain", "block", blockNum)
+
+		// Get the reorg timestamp for logging
+		timestamp, err := p.client.Get(ctx, reorgKey).Result()
+		if err != nil {
+			p.logger.Warn("Failed to get reorg timestamp", "block", blockNum, "err", err)
+		} else {
+			p.logger.Info("Block was reorged at", "timestamp", timestamp, "block", blockNum)
+		}
+
+		return true, nil
+	}
+
+	return false, nil
+}
+
 // GetChainConfig returns the chain configuration for the provider
 func (p *RedisStateProvider) GetChainConfig() *chain.Config {
 	// For simplicity, start with mainnet config
@@ -632,6 +663,361 @@ func (p *RedisStateProvider) BalanceAt(ctx context.Context, address libcommon.Ad
 	}
 
 	return account.Balance.ToBig(), nil
+}
+
+// GetTransactionByHash retrieves a transaction by its hash
+func (p *RedisStateProvider) GetTransactionByHash(ctx context.Context, hash libcommon.Hash) (*types.Transaction, libcommon.Hash, uint64, uint64, error) {
+	txKey := fmt.Sprintf("tx:%s", hash.Hex())
+
+	// Get the transaction data
+	results, err := p.client.ZRevRange(p.ctx, txKey, 0, 0).Result()
+	if err != nil {
+		return nil, libcommon.Hash{}, 0, 0, fmt.Errorf("failed to retrieve transaction %s: %w", hash.Hex(), err)
+	}
+
+	if len(results) == 0 {
+		return nil, libcommon.Hash{}, 0, 0, fmt.Errorf("transaction not found: %s", hash.Hex())
+	}
+
+	// Unmarshal the transaction data
+	var tx types.Transaction
+	if err := json.Unmarshal([]byte(results[0]), &tx); err != nil {
+		return nil, libcommon.Hash{}, 0, 0, fmt.Errorf("failed to unmarshal transaction data: %w", err)
+	}
+
+	// Now find the block information for this transaction
+	blockInfo, err := p.client.ZRevRangeWithScores(p.ctx, txKey, 0, 0).Result()
+	if err != nil || len(blockInfo) == 0 {
+		return nil, libcommon.Hash{}, 0, 0, fmt.Errorf("failed to get block info for transaction: %w", err)
+	}
+
+	blockNum := uint64(blockInfo[0].Score)
+
+	// Get the block hash
+	blockKey := fmt.Sprintf("block:%d", blockNum)
+	blockHash, err := p.client.HGet(p.ctx, blockKey, "hash").Result()
+	if err != nil {
+		return nil, libcommon.Hash{}, 0, 0, fmt.Errorf("failed to get block hash: %w", err)
+	}
+
+	// Find the transaction index in the block
+	blockTxsKey := fmt.Sprintf("block:%d:txs", blockNum)
+	txHashes, err := p.client.SMembers(p.ctx, blockTxsKey).Result()
+	if err != nil {
+		return nil, libcommon.Hash{}, 0, 0, fmt.Errorf("failed to get block transactions: %w", err)
+	}
+
+	txIndex := uint64(0)
+	found := false
+	for i, txHash := range txHashes {
+		if txHash == hash.Hex() {
+			txIndex = uint64(i)
+			found = true
+			break
+		}
+	}
+
+	if !found {
+		p.logger.Warn("Transaction found but index in block not found", "tx", hash.Hex(), "block", blockNum)
+	}
+
+	return &tx, libcommon.HexToHash(blockHash), blockNum, txIndex, nil
+}
+
+// GetTransactionReceipt retrieves a transaction receipt by transaction hash
+func (p *RedisStateProvider) GetTransactionReceipt(ctx context.Context, txHash libcommon.Hash) (*types.Receipt, error) {
+	receiptKey := fmt.Sprintf("receipt:%s", txHash.Hex())
+
+	// Get the receipt data
+	results, err := p.client.ZRevRange(p.ctx, receiptKey, 0, 0).Result()
+	if err != nil {
+		return nil, fmt.Errorf("failed to retrieve receipt for transaction %s: %w", txHash.Hex(), err)
+	}
+
+	if len(results) == 0 {
+		return nil, fmt.Errorf("receipt not found for transaction: %s", txHash.Hex())
+	}
+
+	// Unmarshal the receipt data
+	var receipt types.Receipt
+	if err := json.Unmarshal([]byte(results[0]), &receipt); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal receipt data: %w", err)
+	}
+
+	return &receipt, nil
+}
+
+// GetLogs retrieves logs based on filter criteria
+func (p *RedisStateProvider) GetLogs(ctx context.Context, filter *types.LogFilter) ([]*types.Log, error) {
+	var logs []*types.Log
+
+	// Determine block range
+	fromBlock, toBlock, err := p.resolveBlockRange(filter.FromBlock, filter.ToBlock)
+	if err != nil {
+		return nil, err
+	}
+
+	// Check if we're filtering by address
+	if len(filter.Addresses) > 0 {
+		// Process each address
+		for _, address := range filter.Addresses {
+			addressLogs, err := p.getLogsByAddress(address, fromBlock, toBlock)
+			if err != nil {
+				p.logger.Warn("Error getting logs by address", "address", address.Hex(), "err", err)
+				continue
+			}
+			logs = append(logs, addressLogs...)
+		}
+	} else if len(filter.Topics) > 0 {
+		// Process by topics
+		topicLogs, err := p.getLogsByTopics(filter.Topics, fromBlock, toBlock)
+		if err != nil {
+			return nil, err
+		}
+		logs = append(logs, topicLogs...)
+	} else {
+		// No specific filtering, get all logs in block range
+		// This can be very inefficient for large ranges
+		for blockNum := fromBlock; blockNum <= toBlock; blockNum++ {
+			blockLogs, err := p.getLogsByBlock(blockNum)
+			if err != nil {
+				p.logger.Warn("Error getting logs for block", "block", blockNum, "err", err)
+				continue
+			}
+			logs = append(logs, blockLogs...)
+		}
+	}
+
+	// Apply additional filtering based on both address and topics
+	if len(filter.Addresses) > 0 && len(filter.Topics) > 0 {
+		var filteredLogs []*types.Log
+		for _, log := range logs {
+			// Check if log is from one of the addresses
+			addressMatch := false
+			for _, address := range filter.Addresses {
+				if log.Address == address {
+					addressMatch = true
+					break
+				}
+			}
+
+			if !addressMatch {
+				continue
+			}
+
+			// Check if log matches topics
+			if p.logMatchesTopics(log, filter.Topics) {
+				filteredLogs = append(filteredLogs, log)
+			}
+		}
+		logs = filteredLogs
+	}
+
+	return logs, nil
+}
+
+// resolveBlockRange resolves block range parameters
+func (p *RedisStateProvider) resolveBlockRange(fromBlock, toBlock *rpc.BlockNumber) (uint64, uint64, error) {
+	var from, to uint64
+	var err error
+
+	// Resolve fromBlock
+	if fromBlock == nil {
+		// Default to latest block
+		from, err = p.GetLatestBlockNumber(p.ctx)
+		if err != nil {
+			return 0, 0, err
+		}
+	} else {
+		switch *fromBlock {
+		case rpc.LatestBlockNumber, rpc.PendingBlockNumber:
+			from, err = p.GetLatestBlockNumber(p.ctx)
+			if err != nil {
+				return 0, 0, err
+			}
+		case rpc.EarliestBlockNumber:
+			from = 0
+		default:
+			from = uint64(*fromBlock)
+		}
+	}
+
+	// Resolve toBlock
+	if toBlock == nil {
+		// Default to latest block
+		to, err = p.GetLatestBlockNumber(p.ctx)
+		if err != nil {
+			return 0, 0, err
+		}
+	} else {
+		switch *toBlock {
+		case rpc.LatestBlockNumber, rpc.PendingBlockNumber:
+			to, err = p.GetLatestBlockNumber(p.ctx)
+			if err != nil {
+				return 0, 0, err
+			}
+		case rpc.EarliestBlockNumber:
+			to = 0
+		default:
+			to = uint64(*toBlock)
+		}
+	}
+
+	// Sanity check
+	if to < from {
+		return from, from, nil
+	}
+
+	return from, to, nil
+}
+
+// getLogsByAddress retrieves logs for a specific address
+func (p *RedisStateProvider) getLogsByAddress(address libcommon.Address, fromBlock, toBlock uint64) ([]*types.Log, error) {
+	var logs []*types.Log
+
+	// Get log indices for this address within the block range
+	addressKey := fmt.Sprintf("address:%s:logs", address.Hex())
+	logIndices, err := p.client.ZRangeByScore(p.ctx, addressKey, &redis.ZRangeBy{
+		Min: fmt.Sprintf("%d", fromBlock),
+		Max: fmt.Sprintf("%d", toBlock),
+	}).Result()
+
+	if err != nil {
+		return nil, fmt.Errorf("failed to get logs for address %s: %w", address.Hex(), err)
+	}
+
+	// Retrieve each log
+	for _, indexStr := range logIndices {
+		logIndex, err := strconv.ParseUint(indexStr, 10, 32)
+		if err != nil {
+			p.logger.Warn("Invalid log index", "index", indexStr, "err", err)
+			continue
+		}
+
+		logKey := fmt.Sprintf("log:%d", logIndex)
+		logData, err := p.client.Get(p.ctx, logKey).Result()
+		if err != nil {
+			p.logger.Warn("Failed to get log", "index", logIndex, "err", err)
+			continue
+		}
+
+		var log types.Log
+		if err := json.Unmarshal([]byte(logData), &log); err != nil {
+			p.logger.Warn("Failed to unmarshal log", "index", logIndex, "err", err)
+			continue
+		}
+
+		logs = append(logs, &log)
+	}
+
+	return logs, nil
+}
+
+// getLogsByTopics retrieves logs matching topic filters
+func (p *RedisStateProvider) getLogsByTopics(topics [][]libcommon.Hash, fromBlock, toBlock uint64) ([]*types.Log, error) {
+	if len(topics) == 0 {
+		return nil, nil
+	}
+
+	// For simplicity, we'll use the first topic as the primary filter
+	primaryTopic := topics[0][0]
+	topicKey := fmt.Sprintf("topic:%s", primaryTopic.Hex())
+
+	// Get log indices for this topic within the block range
+	logIndices, err := p.client.ZRangeByScore(p.ctx, topicKey, &redis.ZRangeBy{
+		Min: fmt.Sprintf("%d", fromBlock),
+		Max: fmt.Sprintf("%d", toBlock),
+	}).Result()
+
+	if err != nil {
+		return nil, fmt.Errorf("failed to get logs for topic %s: %w", primaryTopic.Hex(), err)
+	}
+
+	var logs []*types.Log
+
+	// Retrieve each log
+	for _, indexStr := range logIndices {
+		logIndex, err := strconv.ParseUint(indexStr, 10, 32)
+		if err != nil {
+			p.logger.Warn("Invalid log index", "index", indexStr, "err", err)
+			continue
+		}
+
+		logKey := fmt.Sprintf("log:%d", logIndex)
+		logData, err := p.client.Get(p.ctx, logKey).Result()
+		if err != nil {
+			p.logger.Warn("Failed to get log", "index", logIndex, "err", err)
+			continue
+		}
+
+		var log types.Log
+		if err := json.Unmarshal([]byte(logData), &log); err != nil {
+			p.logger.Warn("Failed to unmarshal log", "index", logIndex, "err", err)
+			continue
+		}
+
+		// Check if this log matches all topic filters
+		if p.logMatchesTopics(&log, topics) {
+			logs = append(logs, &log)
+		}
+	}
+
+	return logs, nil
+}
+
+// getLogsByBlock retrieves all logs for a specific block
+func (p *RedisStateProvider) getLogsByBlock(blockNum uint64) ([]*types.Log, error) {
+	var logs []*types.Log
+
+	// Get transaction receipts for the block
+	blockReceiptsKey := fmt.Sprintf("block:%d:receipts", blockNum)
+	txHashes, err := p.client.ZRange(p.ctx, blockReceiptsKey, 0, -1).Result()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get receipts for block %d: %w", blockNum, err)
+	}
+
+	// For each transaction, get the receipt and extract logs
+	for _, txHash := range txHashes {
+		receipt, err := p.GetTransactionReceipt(p.ctx, libcommon.HexToHash(txHash))
+		if err != nil {
+			p.logger.Warn("Failed to get receipt", "tx", txHash, "err", err)
+			continue
+		}
+
+		logs = append(logs, receipt.Logs...)
+	}
+
+	return logs, nil
+}
+
+// logMatchesTopics checks if a log matches the given topic filters
+func (p *RedisStateProvider) logMatchesTopics(log *types.Log, topicFilters [][]libcommon.Hash) bool {
+	// If the log has fewer topics than we're filtering for, it can't match
+	if len(log.Topics) < len(topicFilters) {
+		return false
+	}
+
+	// Check each topic against its corresponding filter
+	for i, topicFilter := range topicFilters {
+		if len(topicFilter) == 0 {
+			// Empty filter means match any topic at this position
+			continue
+		}
+
+		matched := false
+		for _, filterTopic := range topicFilter {
+			if log.Topics[i] == filterTopic {
+				matched = true
+				break
+			}
+		}
+
+		if !matched {
+			return false
+		}
+	}
+
+	return true
 }
 
 // PointInTimeRedisStateReader extends RedisStateReader to read state at a specific block

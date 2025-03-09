@@ -86,9 +86,10 @@ type stateObject struct {
 	// during the "update" phase of the state transition.
 	dirtyCode       bool // true if the code was updated
 	selfdestructed  bool
-	deleted         bool // true if account was deleted during the lifetime of this object
-	newlyCreated    bool // true if this object was created in the current transaction
-	createdContract bool // true if this object represents a newly created contract
+	deleted         bool   // true if account was deleted during the lifetime of this object
+	newlyCreated    bool   // true if this object was created in the current transaction
+	createdContract bool   // true if this object represents a newly created contract
+	blockNum        uint64 // block number when this object was last modified (for Redis state)
 }
 
 // empty returns whether the account is considered empty.
@@ -117,6 +118,12 @@ func newObject(db *IntraBlockState, address libcommon.Address, data, original *a
 		so.data.Root = trie.EmptyRoot
 	}
 	so.original.Copy(original)
+
+	// Set current block number from IntraBlockState if available
+	if db != nil && db.currentBlock > 0 {
+		so.blockNum = db.currentBlock
+	}
+
 	return &so
 }
 

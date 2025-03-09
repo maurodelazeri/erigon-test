@@ -23,11 +23,13 @@ import (
 	"github.com/erigontech/erigon-lib/chain"
 	libcommon "github.com/erigontech/erigon-lib/common"
 	"github.com/erigontech/erigon-lib/crypto"
+	"github.com/erigontech/erigon-lib/log/v3"
 	"github.com/erigontech/erigon/consensus"
 	"github.com/erigontech/erigon/core/state"
 	"github.com/erigontech/erigon/core/types"
 	"github.com/erigontech/erigon/core/vm"
 	"github.com/erigontech/erigon/core/vm/evmtypes"
+	redisstate "github.com/erigontech/erigon/redis-state"
 )
 
 // applyTransaction attempts to apply a transaction to the given state database
@@ -67,6 +69,28 @@ func applyTransaction(config *chain.Config, engine consensus.EngineReader, gp *G
 	// Update the state with pending changes
 	if err = ibs.FinalizeTx(rules, stateWriter); err != nil {
 		return nil, nil, err
+	}
+	
+	// If Redis is enabled, write the state changes to Redis as well
+	if state.IsRedisEnabled() {
+		// Get redis writer using the factory pattern handled elsewhere
+		if redisWriter := state.GetRedisStateWriter(header.Number.Uint64()); redisWriter != nil {
+			if err = ibs.FinalizeTx(rules, redisWriter); err != nil {
+				// Log the error but don't fail the transaction
+				logger := log.Root()
+				logger.Warn("Failed to write transaction state to Redis", "err", err, "block", header.Number.Uint64(), "txHash", txn.Hash().String())
+			}
+		} else {
+			// Try to create one with the external factory
+			redisWriter = redisstate.CreateRedisWriter(header.Number.Uint64())
+			if redisWriter != nil {
+				if err = ibs.FinalizeTx(rules, redisWriter); err != nil {
+					// Log the error but don't fail the transaction
+					logger := log.Root()
+					logger.Warn("Failed to write transaction state to Redis", "err", err, "block", header.Number.Uint64(), "txHash", txn.Hash().String())
+				}
+			}
+		}
 	}
 	*usedGas += result.UsedGas
 	if usedBlobGas != nil {
