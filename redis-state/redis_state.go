@@ -30,11 +30,10 @@ import (
 	libcommon "github.com/erigontech/erigon-lib/common"
 	"github.com/erigontech/erigon-lib/log/v3"
 	"github.com/erigontech/erigon-lib/types/accounts"
-	"github.com/erigontech/erigon/core/state"
 	"github.com/erigontech/erigon/core/types"
 )
 
-// RedisStateReader implements the state.StateReader interface using Redis as the backing store
+// RedisStateReader implements the StateReader interface using Redis as the backing store
 type RedisStateReader struct {
 	client   *redis.Client
 	ctx      context.Context
@@ -42,7 +41,7 @@ type RedisStateReader struct {
 	blockNum uint64 // For point-in-time queries, 0 means latest
 }
 
-// RedisStateWriter implements the state.StateWriter interface using Redis as the backing store
+// RedisStateWriter implements the StateWriter interface using Redis as the backing store
 type RedisStateWriter struct {
 	client   *redis.Client
 	ctx      context.Context
@@ -55,6 +54,9 @@ type RedisStateWriter struct {
 type RedisHistoricalWriter struct {
 	RedisStateWriter
 }
+
+// Each interface method is implemented directly in RedisHistoricalWriter struct
+// This avoids an import cycle with state package
 
 // SerializedAccount is a serializable version of accounts.Account
 type SerializedAccount struct {
@@ -129,6 +131,44 @@ func NewRedisHistoricalWriter(client *redis.Client, blockNum uint64) *RedisHisto
 // GetBlockNum returns the block number for this writer
 func (w *RedisHistoricalWriter) GetBlockNum() uint64 {
 	return w.blockNum
+}
+
+// WriteBlockStart writes the block start marker to Redis, initializing the block context
+func (w *RedisHistoricalWriter) WriteBlockStart(blockNum uint64) error {
+	// Update current block number
+	w.blockNum = blockNum
+	w.txNum = 0 // Reset transaction counter at block start
+	
+	ctx, cancel := context.WithTimeout(w.ctx, 5*time.Second)
+	defer cancel()
+	
+	// Update the current block pointer
+	err := w.client.Set(ctx, "currentBlock", blockNum, 0).Err()
+	if err != nil {
+		return fmt.Errorf("failed to update current block: %w", err)
+	}
+	
+	// Create a block entry if it doesn't exist
+	blockKey := fmt.Sprintf("block:%d", blockNum)
+	exists, err := w.client.Exists(ctx, blockKey).Result()
+	if err != nil {
+		return fmt.Errorf("failed to check block existence: %w", err)
+	}
+	
+	if exists == 0 {
+		// Initialize block data structure
+		blockData := map[string]interface{}{
+			"number": blockNum,
+			"timestamp": time.Now().Unix(),
+		}
+		
+		err = w.client.HSet(ctx, blockKey, blockData).Err()
+		if err != nil {
+			return fmt.Errorf("failed to initialize block data: %w", err)
+		}
+	}
+	
+	return nil
 }
 
 // SetTxNum sets the current transaction number being processed
@@ -683,14 +723,14 @@ func (w *RedisStateWriter) CreateContract(address libcommon.Address) error {
 			Nonce:       0,
 			Balance:     *uint256.NewInt(0),
 			CodeHash:    libcommon.Hash{},
-			Incarnation: state.FirstContractIncarnation,
+			Incarnation: 1, // FirstContractIncarnation
 		}
 	} else {
 		// Existing account, set incarnation
 		// If this is the first time it's becoming a contract, use FirstContractIncarnation
 		// Otherwise increment the existing incarnation
 		if account.Incarnation == 0 {
-			account.Incarnation = state.FirstContractIncarnation
+			account.Incarnation = 1 // FirstContractIncarnation
 		} else {
 			account.Incarnation++
 		}

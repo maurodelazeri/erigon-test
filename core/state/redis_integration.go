@@ -33,6 +33,15 @@ type RedisWriter interface {
 	GetTxNum() uint64
 }
 
+// RedisHistoricalWriter extends RedisWriter with historical data capabilities
+type RedisHistoricalWriter interface {
+	RedisWriter
+	WriteChangeSets() error
+	WriteHistory() error
+	WriteBlockStart(blockNum uint64) error
+	HandleTransaction(tx interface{}, receipt interface{}, blockNum uint64, txIndex uint64) error
+}
+
 var (
 	// Global Redis client and writer instances - will be initialized on startup if Redis is enabled
 	redisClient          *redis.Client

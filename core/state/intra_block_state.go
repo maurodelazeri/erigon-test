@@ -31,6 +31,7 @@ import (
 	libcommon "github.com/erigontech/erigon-lib/common"
 	"github.com/erigontech/erigon-lib/common/u256"
 	"github.com/erigontech/erigon-lib/crypto"
+	"github.com/erigontech/erigon-lib/log/v3"
 	"github.com/erigontech/erigon-lib/trie"
 	"github.com/erigontech/erigon-lib/types/accounts"
 	"github.com/erigontech/erigon/core/tracing"
@@ -979,6 +980,25 @@ func (sdb *IntraBlockState) SetTxContext(ti int) {
 // This is used for Redis state integration
 func (sdb *IntraBlockState) SetBlockContext(blockNum uint64) {
 	sdb.currentBlock = blockNum
+	
+	// Initialize Redis state for this block if Redis is enabled
+	if IsRedisEnabled() {
+		// Create a new writer if needed
+		redisWriter := GetRedisStateWriter(blockNum)
+		
+		// Initialize block in Redis
+		if redisWriter != nil {
+			if redisHistoryWriter, ok := redisWriter.(interface {
+				WriteBlockStart(blockNum uint64) error
+			}); ok {
+				if err := redisHistoryWriter.WriteBlockStart(blockNum); err != nil {
+					// Log the error but don't fail
+					logger := log.Root()
+					logger.Warn("Failed to initialize block in Redis", "block", blockNum, "err", err)
+				}
+			}
+		}
+	}
 }
 
 // no not lock

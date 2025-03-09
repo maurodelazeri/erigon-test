@@ -29,7 +29,6 @@ import (
 	"github.com/erigontech/erigon/core/types"
 	"github.com/erigontech/erigon/core/vm"
 	"github.com/erigontech/erigon/core/vm/evmtypes"
-	redisstate "github.com/erigontech/erigon/redis-state"
 )
 
 // applyTransaction attempts to apply a transaction to the given state database
@@ -80,16 +79,6 @@ func applyTransaction(config *chain.Config, engine consensus.EngineReader, gp *G
 				logger := log.Root()
 				logger.Warn("Failed to write transaction state to Redis", "err", err, "block", header.Number.Uint64(), "txHash", txn.Hash().String())
 			}
-		} else {
-			// Try to create one with the external factory
-			redisWriter = redisstate.CreateRedisWriter(header.Number.Uint64())
-			if redisWriter != nil {
-				if err = ibs.FinalizeTx(rules, redisWriter); err != nil {
-					// Log the error but don't fail the transaction
-					logger := log.Root()
-					logger.Warn("Failed to write transaction state to Redis", "err", err, "block", header.Number.Uint64(), "txHash", txn.Hash().String())
-				}
-			}
 		}
 	}
 	*usedGas += result.UsedGas
@@ -119,6 +108,24 @@ func applyTransaction(config *chain.Config, engine consensus.EngineReader, gp *G
 		receipt.Bloom = types.CreateBloom(types.Receipts{receipt})
 		receipt.BlockNumber = header.Number
 		receipt.TransactionIndex = uint(ibs.TxnIndex())
+	}
+
+	// Add Redis transaction and receipt handling
+	if state.IsRedisEnabled() && receipt != nil {
+		if redisWriter := state.GetRedisStateWriter(header.Number.Uint64()); redisWriter != nil {
+			// Set transaction index
+			redisWriter.SetTxNum(uint64(receipt.TransactionIndex))
+			
+			// Try to cast to RedisHistoricalWriter to use HandleTransaction
+			redisHistoryWriter, ok := redisWriter.(state.RedisHistoricalWriter)
+			if ok {
+				// Handle transaction and receipt
+				if err := redisHistoryWriter.HandleTransaction(txn, receipt, header.Number.Uint64(), uint64(receipt.TransactionIndex)); err != nil {
+					logger := log.Root()
+					logger.Warn("Failed to write transaction to Redis", "err", err, "block", header.Number.Uint64(), "txHash", txn.Hash().String())
+				}
+			}
+		}
 	}
 
 	return receipt, result.ReturnData, err

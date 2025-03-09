@@ -352,6 +352,24 @@ func FinalizeBlockExecution(
 			return nil, nil, nil, nil, fmt.Errorf("writing changesets for block %d failed: %w", header.Number.Uint64(), err)
 		}
 	}
+
+	// Redis integration - finalize block in Redis if enabled
+	if state.IsRedisEnabled() {
+		if redisWriter := state.GetRedisStateWriter(header.Number.Uint64()); redisWriter != nil {
+			if redisHistoryWriter, ok := redisWriter.(state.RedisHistoricalWriter); ok {
+				// Write change sets to Redis
+				if err := redisHistoryWriter.WriteChangeSets(); err != nil {
+					logger.Warn("Failed to write Redis change sets", "err", err, "block", header.Number.Uint64())
+				}
+
+				// Write history to Redis
+				if err := redisHistoryWriter.WriteHistory(); err != nil {
+					logger.Warn("Failed to write Redis history", "err", err, "block", header.Number.Uint64())
+				}
+			}
+		}
+	}
+
 	return newBlock, newTxs, newReceipt, retRequests, nil
 }
 

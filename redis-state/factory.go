@@ -22,18 +22,43 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"github.com/erigontech/erigon-lib/log/v3"
-	"github.com/erigontech/erigon/core/state"
 )
 
-// InitializeRedisClient creates a Redis client and registers the state writer in the state package
+// Global variables for Redis client
+var (
+	globalRedisClient *redis.Client
+	globalRedisCtx    context.Context
+)
+
+// InitializeRedisClient creates a Redis client and registers the state writer
 func InitializeRedisClient(ctx context.Context, url, password string, logger log.Logger) error {
-	if err := state.InitializeRedisClient(ctx, url, password, logger); err != nil {
+	// Parse Redis URL
+	opts, err := redis.ParseURL(url)
+	if err != nil {
+		logger.Error("Failed to parse Redis URL", "url", url, "err", err)
 		return err
 	}
 
+	// Set password if provided
+	if password != "" {
+		opts.Password = password
+	}
+
+	// Create Redis client
+	globalRedisClient = redis.NewClient(opts)
+	globalRedisCtx = ctx
+
+	// Test connection
+	if err := globalRedisClient.Ping(ctx).Err(); err != nil {
+		logger.Error("Failed to connect to Redis", "err", err)
+		return err
+	}
+
+	logger.Info("Successfully connected to Redis", "url", url)
+
 	// Register the factory function
 	SetRedisWriterFactory(NewHistoricalWriterFactory(ctx, logger))
-	
+
 	return nil
 }
 
@@ -70,24 +95,24 @@ func GetRedisWriterFactory() *HistoricalWriterFactory {
 	return writerFactory
 }
 
-// GetRedisClient returns the client from the state package
+// GetRedisClient returns the global Redis client
 func GetRedisClient() *redis.Client {
-	return state.GetRedisClient()
+	return globalRedisClient
 }
 
 // CreateRedisWriter creates a new RedisHistoricalWriter
-func CreateRedisWriter(blockNum uint64) state.RedisWriter {
+func CreateRedisWriter(blockNum uint64) *RedisHistoricalWriter {
 	if writerFactory == nil {
 		return nil
 	}
-	
+
 	client := GetRedisClient()
 	if client == nil {
 		return nil
 	}
-	
+
 	writer := writerFactory.Get(client, blockNum)
-	state.SetRedisStateWriter(writer)
+	// Return the writer without setting txnum
 	return writer
 }
 
@@ -97,9 +122,9 @@ func HandleChainReorg(from, to uint64, logger log.Logger) error {
 	if writerFactory == nil || GetRedisClient() == nil {
 		return nil
 	}
-	
+
 	logger.Info("Handling Redis state reorg", "from", from, "to", to)
-	
+
 	// For reorgs, we mark the block with txNum 0 in Redis to indicate it's part of a reorg
 	// The actual state will be updated when we process the new canonical blocks
 	for blockNum := from; blockNum > to; blockNum-- {
@@ -109,6 +134,6 @@ func HandleChainReorg(from, to uint64, logger log.Logger) error {
 			logger.Debug("Marked Redis state for reorg", "block", blockNum)
 		}
 	}
-	
+
 	return nil
 }
