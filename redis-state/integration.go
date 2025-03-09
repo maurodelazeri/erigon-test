@@ -371,6 +371,13 @@ func (p *BlockHeaderProcessor) HandleBlock(block *types.Block, receipts types.Re
 			"txErrors", txErrors)
 	}
 	
+	// Track canonical chain for this block
+	canonicalKey := "canonicalChain"
+	pipe.ZAdd(ctx, canonicalKey, redis.Z{
+		Score:  float64(blockNum),
+		Member: blockHash.Hex(),
+	})
+	
 	// Store a compact block representation for quick access
 	blockSummary := map[string]interface{}{
 		"hash":            blockHash.Hex(),
@@ -383,6 +390,7 @@ func (p *BlockHeaderProcessor) HandleBlock(block *types.Block, receipts types.Re
 		"stateRoot":       block.Root().Hex(),
 		"receiptsRoot":    block.ReceiptHash().Hex(),
 		"transactionsRoot": block.TxHash().Hex(),
+		"canonical":       true,
 	}
 	
 	blockSummaryData, err := json.Marshal(blockSummary)
@@ -391,6 +399,10 @@ func (p *BlockHeaderProcessor) HandleBlock(block *types.Block, receipts types.Re
 		blockSummaryKey := fmt.Sprintf("block:%d:summary", blockNum)
 		pipe.Set(ctx, blockSummaryKey, blockSummaryData, 0)
 	}
+	
+	// Store or update canonical status on the hash to number mapping
+	hashKey := fmt.Sprintf("blockHash:%s", blockHash.Hex())
+	pipe.HSet(ctx, hashKey, "canonical", true)
 	
 	// Execute all pipeline commands
 	cmds, err := pipe.Exec(ctx)

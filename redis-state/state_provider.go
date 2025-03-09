@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"math/big"
 	"strconv"
+	"time"
 
 	"github.com/holiman/uint256"
 	"github.com/redis/go-redis/v9"
@@ -49,10 +50,74 @@ type RedisStateProvider struct {
 
 // NewRedisStateProvider creates a new instance of RedisStateProvider
 func NewRedisStateProvider(client *redis.Client, logger log.Logger) *RedisStateProvider {
-	return &RedisStateProvider{
+	provider := &RedisStateProvider{
 		client: client,
 		ctx:    context.Background(),
 		logger: logger,
+	}
+
+	// Initialize canonicalChain sorted set if it doesn't exist
+	provider.ensureCanonicalChainExists()
+
+	return provider
+}
+
+// ensureCanonicalChainExists makes sure the canonicalChain sorted set exists
+// This is critical for tracking the canonical chain and handling reorgs
+func (p *RedisStateProvider) ensureCanonicalChainExists() {
+	ctx, cancel := context.WithTimeout(p.ctx, 5*time.Second)
+	defer cancel()
+
+	// Check if the canonical chain key exists
+	canonicalKey := "canonicalChain"
+	exists, err := p.client.Exists(ctx, canonicalKey).Result()
+	if err != nil {
+		p.logger.Warn("Failed to check if canonical chain exists", "err", err)
+		return
+	}
+
+	if exists == 0 {
+		// The canonical chain key doesn't exist - initialize it
+		// We'll need to find the current head block and work backwards
+		currentBlockStr, err := p.client.Get(ctx, "currentBlock").Result()
+		if err != nil {
+			p.logger.Warn("Failed to get current block", "err", err)
+			return
+		}
+
+		currentBlock, err := strconv.ParseUint(currentBlockStr, 10, 64)
+		if err != nil {
+			p.logger.Warn("Failed to parse current block", "err", err)
+			return
+		}
+
+		// Create a pipeline to add blocks to the canonical chain
+		pipe := p.client.Pipeline()
+		count := 0
+
+		// Add the current block first
+		blockKey := fmt.Sprintf("block:%d", currentBlock)
+		blockHashBytes, err := p.client.HGet(ctx, blockKey, "hash").Result()
+		if err == nil && blockHashBytes != "" {
+			pipe.ZAdd(ctx, canonicalKey, redis.Z{
+				Score:  float64(currentBlock),
+				Member: blockHashBytes,
+			})
+			count++
+
+			// Also make sure the block hash entry has the canonical flag
+			hashKey := fmt.Sprintf("blockHash:%s", blockHashBytes)
+			pipe.HSet(ctx, hashKey, "canonical", true)
+		}
+
+		// Execute the pipeline
+		_, err = pipe.Exec(ctx)
+		if err != nil {
+			p.logger.Warn("Failed to initialize canonical chain", "err", err)
+			return
+		}
+
+		p.logger.Info("Initialized canonical chain", "blocksAdded", count)
 	}
 }
 
@@ -74,7 +139,7 @@ func (p *RedisStateProvider) GetBlockHashFn(currentNum uint64) func(n uint64) li
 		if n > currentNum {
 			return libcommon.Hash{}
 		}
-		
+
 		// Look up block hash
 		key := fmt.Sprintf("block:%d", n)
 		result, err := p.client.HGet(p.ctx, key, "hash").Result()
@@ -82,7 +147,7 @@ func (p *RedisStateProvider) GetBlockHashFn(currentNum uint64) func(n uint64) li
 			p.logger.Warn("Failed to get block hash", "number", n, "err", err)
 			return libcommon.Hash{}
 		}
-		
+
 		return libcommon.HexToHash(result)
 	}
 }
@@ -113,7 +178,7 @@ func (p *RedisStateProvider) GetBlockByNumber(ctx context.Context, blockNumber r
 	// Convert BlockNumber to uint64
 	var blockNum uint64
 	var err error
-	
+
 	switch blockNumber {
 	case rpc.LatestBlockNumber, rpc.PendingBlockNumber:
 		// Get the latest block number from Redis
@@ -126,11 +191,11 @@ func (p *RedisStateProvider) GetBlockByNumber(ctx context.Context, blockNumber r
 	default:
 		blockNum = uint64(blockNumber)
 	}
-	
+
 	// Try to get the block summary first (quicker)
 	blockSummaryKey := fmt.Sprintf("block:%d:summary", blockNum)
 	summaryData, err := p.client.Get(p.ctx, blockSummaryKey).Result()
-	
+
 	if err == nil {
 		// We have a summary, use it as the base
 		var blockSummary map[string]interface{}
@@ -156,13 +221,13 @@ func (p *RedisStateProvider) GetBlockByNumber(ctx context.Context, blockNumber r
 			return blockSummary, nil
 		}
 	}
-	
+
 	// If we don't have a summary or it failed to unmarshal, get the full block data
 	block, err := p.BlockByNumber(ctx, blockNumber)
 	if err != nil {
 		return nil, err
 	}
-	
+
 	// Convert block to map
 	result := map[string]interface{}{
 		"number":           fmt.Sprintf("0x%x", block.NumberU64()),
@@ -183,7 +248,7 @@ func (p *RedisStateProvider) GetBlockByNumber(ctx context.Context, blockNumber r
 		"gasUsed":          fmt.Sprintf("0x%x", block.GasUsed()),
 		"timestamp":        fmt.Sprintf("0x%x", block.Time()),
 	}
-	
+
 	// Add transactions
 	if fullTx {
 		result["transactions"], err = p.getBlockTransactions(ctx, blockNum)
@@ -198,43 +263,43 @@ func (p *RedisStateProvider) GetBlockByNumber(ctx context.Context, blockNumber r
 			result["transactions"] = []interface{}{}
 		}
 	}
-	
+
 	return result, nil
 }
 
 // getBlockTransactionHashes retrieves all transaction hashes for a block
 func (p *RedisStateProvider) getBlockTransactionHashes(ctx context.Context, blockNum uint64) ([]interface{}, error) {
 	blockTxsKey := fmt.Sprintf("block:%d:txs", blockNum)
-	
+
 	// Get transaction hashes
 	txHashes, err := p.client.SMembers(p.ctx, blockTxsKey).Result()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get block transaction hashes: %w", err)
 	}
-	
+
 	// Convert to interface slice
 	result := make([]interface{}, len(txHashes))
 	for i, hash := range txHashes {
 		result[i] = hash
 	}
-	
+
 	return result, nil
 }
 
 // getBlockTransactions retrieves all transactions for a block with full details
 func (p *RedisStateProvider) getBlockTransactions(ctx context.Context, blockNum uint64) ([]interface{}, error) {
 	blockTxsKey := fmt.Sprintf("block:%d:txs", blockNum)
-	
+
 	// Get transaction hashes
 	txHashes, err := p.client.SMembers(p.ctx, blockTxsKey).Result()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get block transaction hashes: %w", err)
 	}
-	
+
 	// Create a pipeline to fetch all transactions in a batch
 	pipe := p.client.Pipeline()
 	commands := make([]redis.Cmder, len(txHashes))
-	
+
 	// Queue up all transaction fetch commands
 	for i, hash := range txHashes {
 		txKey := fmt.Sprintf("tx:%s", hash)
@@ -245,13 +310,13 @@ func (p *RedisStateProvider) getBlockTransactions(ctx context.Context, blockNum 
 			Count:  1,
 		})
 	}
-	
+
 	// Execute pipeline
 	_, err = pipe.Exec(p.ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to execute transaction fetch pipeline: %w", err)
 	}
-	
+
 	// Process results
 	result := make([]interface{}, 0, len(txHashes))
 	for i, cmd := range commands {
@@ -260,25 +325,25 @@ func (p *RedisStateProvider) getBlockTransactions(ctx context.Context, blockNum 
 			p.logger.Warn("Failed to convert Redis command", "hash", txHashes[i])
 			continue
 		}
-		
+
 		values, err := zRangeCmd.Result()
 		if err != nil {
 			p.logger.Warn("Failed to get transaction data", "hash", txHashes[i], "err", err)
 			continue
 		}
-		
+
 		if len(values) == 0 {
 			p.logger.Warn("Transaction not found", "hash", txHashes[i], "block", blockNum)
 			continue
 		}
-		
+
 		// Parse transaction
 		var tx types.Transaction
 		if err := json.Unmarshal([]byte(values[0]), &tx); err != nil {
 			p.logger.Warn("Failed to unmarshal transaction", "hash", txHashes[i], "err", err)
 			continue
 		}
-		
+
 		// Convert to map
 		txMap := map[string]interface{}{
 			"hash":             tx.Hash().Hex(),
@@ -287,25 +352,25 @@ func (p *RedisStateProvider) getBlockTransactions(ctx context.Context, blockNum 
 			"blockNumber":      fmt.Sprintf("0x%x", blockNum),
 			"transactionIndex": fmt.Sprintf("0x%x", i),
 		}
-		
+
 		// Handle from address
 		if sender, ok := tx.GetSender(); ok {
 			txMap["from"] = sender.Hex()
 		} else {
 			txMap["from"] = "0x0000000000000000000000000000000000000000"
 		}
-		
+
 		// Handle to address
 		if to := tx.GetTo(); to != nil {
 			txMap["to"] = to.Hex()
 		} else {
 			txMap["to"] = nil // null for contract creation
 		}
-		
+
 		// Handle value, gas price, gas and input data
 		txMap["value"] = fmt.Sprintf("0x%x", tx.GetValue())
 		txMap["gas"] = fmt.Sprintf("0x%x", tx.GetGas())
-		
+
 		// Handle different transaction types for gas pricing
 		if tx.Type() == types.DynamicFeeTxType {
 			txMap["maxFeePerGas"] = fmt.Sprintf("0x%x", tx.GetFeeCap())
@@ -314,16 +379,16 @@ func (p *RedisStateProvider) getBlockTransactions(ctx context.Context, blockNum 
 		} else {
 			txMap["gasPrice"] = fmt.Sprintf("0x%x", tx.GetPrice())
 		}
-		
+
 		txMap["input"] = fmt.Sprintf("0x%x", tx.GetData())
-		
+
 		result = append(result, txMap)
 	}
-	
+
 	return result, nil
 }
 
-// BlockByNumber returns a block by its number
+// BlockByNumber returns a block by its number with chain reorganization awareness
 func (p *RedisStateProvider) BlockByNumber(ctx context.Context, number rpc.BlockNumber) (*types.Block, error) {
 	// Convert BlockNumber to uint64
 	var blockNum uint64
@@ -347,9 +412,104 @@ func (p *RedisStateProvider) BlockByNumber(ctx context.Context, number rpc.Block
 
 	// Get block hash and header
 	blockKey := fmt.Sprintf("block:%d", blockNum)
+
+	// Get all block data with HGETALL to get hash and header
+	blockData, err := p.client.HGetAll(p.ctx, blockKey).Result()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get block data: %w", err)
+	}
+
+	if len(blockData) == 0 {
+		return nil, fmt.Errorf("block not found: %d", blockNum)
+	}
+
+	// Check if this block is canonical (the most recent version after any reorgs)
+	blockHash := blockData["hash"]
+	if blockHash == "" {
+		return nil, fmt.Errorf("block hash missing for block: %d", blockNum)
+	}
+
+	// Verify this is a canonical block by checking the canonical chain
+	canonicalKey := "canonicalChain"
+	isCanonical, err := p.client.ZScore(p.ctx, canonicalKey, blockHash).Result()
+	if err != nil && err != redis.Nil {
+		// Log the error but continue - we'll use the block we have
+		p.logger.Warn("Failed to check if block is canonical", "block", blockNum, "hash", blockHash, "err", err)
+	}
+
+	// If block is not in the canonical chain but we found a hash in the block data
+	// this means we had a reorg, but we can try to use this block anyway (with a warning)
+	if err == redis.Nil && blockHash != "" {
+		p.logger.Warn("Block is not in canonical chain, possible stale data from reorg",
+			"block", blockNum,
+			"hash", blockHash)
+	}
+
+	headerBytes := blockData["header"]
+	if headerBytes == "" {
+		return nil, fmt.Errorf("block header missing for block: %d", blockNum)
+	}
+
+	// Parse header
+	var header types.Header
+	if err := json.Unmarshal([]byte(headerBytes), &header); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal header: %w", err)
+	}
+
+	// For simplicity, we're returning a block with just the header
+	// In a real implementation, you'd also fetch the transactions and receipts
+	block := types.NewBlockWithHeader(&header)
+
+	// Log if we're using a non-canonical block due to reorg
+	if err == redis.Nil && blockHash != "" {
+		p.logger.Debug("Using non-canonical block",
+			"block", blockNum,
+			"hash", blockHash,
+			"header", header.Hash().Hex())
+	} else if isCanonical > 0 {
+		p.logger.Debug("Using canonical block",
+			"block", blockNum,
+			"hash", blockHash,
+			"score", isCanonical)
+	}
+
+	return block, nil
+}
+
+// BlockByHash returns a block by its hash with chain reorganization awareness
+func (p *RedisStateProvider) BlockByHash(ctx context.Context, hash libcommon.Hash) (*types.Block, error) {
+	// Get block information including canonical status
+	hashKey := fmt.Sprintf("blockHash:%s", hash.Hex())
+	blockData, err := p.client.HGetAll(p.ctx, hashKey).Result()
+	if err != nil || len(blockData) == 0 {
+		return nil, fmt.Errorf("block hash not found: %s", hash.Hex())
+	}
+
+	// Extract the block number
+	blockNumStr, ok := blockData["number"]
+	if !ok || blockNumStr == "" {
+		return nil, fmt.Errorf("block number missing for hash: %s", hash.Hex())
+	}
+
+	blockNum, err := strconv.ParseUint(blockNumStr, 10, 64)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse block number: %w", err)
+	}
+
+	// Check if this block is canonical
+	isCanonical, ok := blockData["canonical"]
+	if !ok || isCanonical != "true" {
+		// Block exists but is not canonical (from a reorganized branch)
+		p.logger.Warn("Request for non-canonical block by hash",
+			"hash", hash.Hex(),
+			"block", blockNum)
+	}
+
+	// Get block hash and header directly from block data
+	blockKey := fmt.Sprintf("block:%d", blockNum)
 	headerBytes, err := p.client.HGet(p.ctx, blockKey, "header").Result()
 	if err == redis.Nil {
-		return nil, fmt.Errorf("block not found: %d", blockNum)
+		return nil, fmt.Errorf("block header not found for block: %d", blockNum)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to get block header: %w", err)
@@ -367,36 +527,50 @@ func (p *RedisStateProvider) BlockByNumber(ctx context.Context, number rpc.Block
 	return block, nil
 }
 
-// BlockByHash returns a block by its hash
-func (p *RedisStateProvider) BlockByHash(ctx context.Context, hash libcommon.Hash) (*types.Block, error) {
-	// Convert hash to block number
-	hashKey := fmt.Sprintf("blockHash:%s", hash.Hex())
-	blockNumStr, err := p.client.Get(p.ctx, hashKey).Result()
-	if err == redis.Nil {
-		return nil, fmt.Errorf("block hash not found: %s", hash.Hex())
-	}
-	if err != nil {
-		return nil, fmt.Errorf("failed to get block number for hash: %w", err)
-	}
-
-	blockNum, err := strconv.ParseUint(blockNumStr, 10, 64)
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse block number: %w", err)
-	}
-
-	// Use BlockByNumber to get the block
-	return p.BlockByNumber(ctx, rpc.BlockNumber(blockNum))
-}
-
 // StateAtBlock returns a state reader for a specific block
+// This method is enhanced to handle chain reorganizations by checking block canonicity
 func (p *RedisStateProvider) StateAtBlock(ctx context.Context, block *types.Block) (evmtypes.IntraBlockState, error) {
 	if block == nil {
 		return nil, errors.New("block is nil")
 	}
 
+	// Verify this block is canonical by checking both the block number and hash
+	blockNum := block.NumberU64()
+	blockHash := block.Hash()
+
+	// Check if this is a canonical block
+	canonicalKey := "canonicalChain"
+	isCanonical, err := p.client.ZScore(p.ctx, canonicalKey, blockHash.Hex()).Result()
+
+	// If the block is not in the canonical chain, log a warning
+	// This is important for simulations to be aware they might be using non-canonical state
+	if err == redis.Nil {
+		// Block not found in canonical chain - this could be due to a reorg
+		p.logger.Warn("Loading state for non-canonical block",
+			"blockNum", blockNum,
+			"blockHash", blockHash.Hex())
+
+		// We'll still proceed with loading state for this block, even if it's not canonical
+	} else if err != nil {
+		// Some other error occurred - log but continue
+		p.logger.Warn("Failed to check if block is canonical",
+			"blockNum", blockNum,
+			"blockHash", blockHash.Hex(),
+			"err", err)
+	} else {
+		// Block is confirmed canonical
+		p.logger.Debug("Loading state for canonical block",
+			"blockNum", blockNum,
+			"blockHash", blockHash.Hex(),
+			"score", isCanonical)
+	}
+
 	// Create a reader for the block's state
-	reader := NewPointInTimeRedisStateReader(p.client, block.NumberU64())
-	state := NewRedisIntraBlockState(reader, block.NumberU64())
+	// We use a specific point-in-time reader that looks up the state as of this block
+	reader := NewPointInTimeRedisStateReader(p.client, blockNum)
+
+	// Create the intra-block state using this reader
+	state := NewRedisIntraBlockState(reader, blockNum)
 
 	return state, nil
 }
@@ -575,15 +749,15 @@ func (al *accessList) AddAddress(addr libcommon.Address) bool {
 
 func (al *accessList) AddSlot(addr libcommon.Address, slot libcommon.Hash) (bool, bool) {
 	addrChange := al.AddAddress(addr)
-	
+
 	if al.slots[addr] == nil {
 		al.slots[addr] = make(map[libcommon.Hash]bool)
 	}
-	
+
 	if al.slots[addr][slot] {
 		return addrChange, false
 	}
-	
+
 	al.slots[addr][slot] = true
 	return addrChange, true
 }

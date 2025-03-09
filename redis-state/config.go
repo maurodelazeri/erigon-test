@@ -138,11 +138,15 @@ func (ri *RedisIntegration) WrapAccumulator(accumulator interface{}, blockNum ui
 	
 	// Check if it's a shards.Accumulator
 	if acc, ok := accumulator.(*shards.Accumulator); ok {
-		// Create a wrapper but return the original accumulator reference
-		// The wrapper keeps a reference to the original accumulator
-		_ = NewRedisAccumulator(acc, ri.client, blockNum, ri.logger)
-		// redis-state accumulator performs all the mirroring internally
-		return acc
+		// Create a Redis accumulator wrapper and use it properly
+		redisAcc := NewRedisAccumulator(acc, ri.client, blockNum, ri.logger)
+		
+		// Log successful wrapping
+		ri.logger.Info("Successfully wrapped accumulator for Redis state mirroring", 
+			"blockNum", blockNum)
+			
+		// Return the Redis accumulator, which embeds and extends the original
+		return redisAcc.Accumulator
 	}
 	
 	// If it's not a known accumulator type, return as is

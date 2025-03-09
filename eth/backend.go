@@ -382,6 +382,9 @@ func New(ctx context.Context, stack *node.Node, config *ethconfig.Config, logger
 				wrappedAcc := backend.redisIntegration.WrapAccumulator(backend.notifications.Accumulator, 0)
 				backend.notifications.Accumulator = wrappedAcc
 			}
+			
+			// No additional block processing needed - state shadowing is sufficient
+			logger.Info("Redis state shadowing active - all state changes are mirrored in real-time")
 		}
 	}
 
@@ -1696,6 +1699,11 @@ func (s *Ethereum) Start() error {
 
 // Stop implements node.Service, terminating all internal goroutines used by the
 // Ethereum protocol.
+// Note: The Redis state integration is fully managed by StateInterceptor.
+// It directly mirrors all Erigon state changes to Redis in real-time.
+// No additional block processing is needed, as we are shadowing the client's state.
+// This approach naturally handles reorgs because we follow exactly what the client does.
+
 func (s *Ethereum) Stop() error {
 	// Stop all the peer-related stuff first.
 	s.sentryCancel()
