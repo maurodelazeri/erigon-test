@@ -221,6 +221,10 @@ func (p *BlockHeaderProcessor) ProcessBlockHeader(header *types.Header) error {
 	blockNum := header.Number.Uint64()
 	blockHash := header.Hash()
 
+	// Log that we're processing this block - this confirms integration is working
+	p.logger.Info("REDIS: Processing block header", "number", blockNum, "hash", blockHash.Hex())
+	fmt.Printf("\n\n!!! REDIS PROCESSING HEADER: %d, %s !!!\n\n", blockNum, blockHash.Hex())
+
 	// Marshal header
 	headerBytes, err := json.Marshal(header)
 	if err != nil {
@@ -232,7 +236,7 @@ func (p *BlockHeaderProcessor) ProcessBlockHeader(header *types.Header) error {
 		return fmt.Errorf("failed to write block header: %w", err)
 	}
 
-	p.logger.Debug("Processed block header", "number", blockNum, "hash", blockHash.Hex())
+	p.logger.Info("Successfully processed block header", "number", blockNum, "hash", blockHash.Hex())
 	return nil
 }
 
@@ -288,12 +292,30 @@ func (p *BlockHeaderProcessor) ProcessBlockReceipts(block *types.Block, receipts
 
 // HandleBlock processes a block and writes its data to Redis
 func (p *BlockHeaderProcessor) HandleBlock(block *types.Block, receipts types.Receipts) error {
+	if block == nil {
+		return fmt.Errorf("nil block")
+	}
+	
 	blockNum := block.NumberU64()
 	blockHash := block.Hash()
+	
+	// Super aggressive logging to make sure we see this
+	fmt.Printf("\n\n!!! REDIS PROCESSING FULL BLOCK: %d, %s !!!\n\n", blockNum, blockHash.Hex())
 	
 	// Enhanced error handling with retries and more detailed logging
 	ctx, cancel := context.WithTimeout(p.ctx, 15*time.Second) // Generous timeout for processing entire block
 	defer cancel()
+	
+	// REDIS DIRECT TEST - Make absolutely sure Redis is working
+	testKey := fmt.Sprintf("redis_block_test_%d", blockNum)
+	testValue := fmt.Sprintf("Block %d processed at %s", blockNum, time.Now().Format(time.RFC3339))
+	if err := p.redisClient.Set(ctx, testKey, testValue, 24*time.Hour).Err(); err != nil {
+		p.logger.Error("CRITICAL: Direct Redis write failed", "key", testKey, "err", err)
+		// Continue anyway to see if other operations work
+	} else {
+		p.logger.Error("REDIS Direct test succeeded", "key", testKey, "value", testValue)
+		fmt.Printf("\n\n!!! REDIS DIRECT TEST WORKED: %s = %s !!!\n\n", testKey, testValue)
+	}
 	
 	// Create a Redis pipeline for batching operations
 	pipe := p.redisClient.Pipeline()
@@ -419,6 +441,45 @@ func (p *BlockHeaderProcessor) HandleBlock(block *types.Block, receipts types.Re
 	
 	p.logger.Info("Block processed and written to Redis", "block", blockNum, "hash", blockHash.Hex(), 
 		"txCount", len(block.Transactions()), "receiptCount", len(receipts))
+	return nil
+}
+
+// HandleTransaction processes a transaction and writes it to Redis
+// This method handles raw transactions from the transaction hook
+func (p *BlockHeaderProcessor) HandleTransaction(tx types.Transaction, blockNum uint64) error {
+	txHash := tx.Hash()
+	
+	// Log that we're processing this transaction
+	p.logger.Debug("REDIS: Processing transaction", "hash", txHash.Hex(), "blockNum", blockNum)
+	
+	// Marshal transaction data
+	txData, err := json.Marshal(tx)
+	if err != nil {
+		return fmt.Errorf("failed to marshal transaction: %w", err)
+	}
+	
+	// Use our block writer to write the transaction to Redis
+	if err := p.blockWriter.WriteTransaction(txHash, blockNum, txData); err != nil {
+		return fmt.Errorf("failed to write transaction: %w", err)
+	}
+	
+	// Store transaction metadata for quick lookups
+	ctx, cancel := context.WithTimeout(p.ctx, 5*time.Second)
+	defer cancel()
+	
+	// Set block number for this transaction - allows finding transactions by block
+	txBlockKey := fmt.Sprintf("tx:%s:block", txHash.Hex())
+	if err := p.redisClient.Set(ctx, txBlockKey, blockNum, 0).Err(); err != nil {
+		p.logger.Warn("Failed to set transaction block number", "txHash", txHash.Hex(), "err", err)
+	}
+	
+	// Store the transaction in the block's transaction list
+	blockTxsKey := fmt.Sprintf("block:%d:txs", blockNum)
+	if err := p.redisClient.SAdd(ctx, blockTxsKey, txHash.Hex()).Err(); err != nil {
+		p.logger.Warn("Failed to add transaction to block transactions set", "txHash", txHash.Hex(), "err", err)
+	}
+	
+	p.logger.Debug("Successfully processed transaction", "hash", txHash.Hex(), "blockNum", blockNum)
 	return nil
 }
 

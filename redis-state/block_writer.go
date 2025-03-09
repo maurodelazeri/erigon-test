@@ -18,6 +18,7 @@ package redisstate
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"time"
 
@@ -25,6 +26,7 @@ import (
 
 	libcommon "github.com/erigontech/erigon-lib/common"
 	"github.com/erigontech/erigon-lib/log/v3"
+	"github.com/erigontech/erigon/core/types"
 )
 
 // RedisBlockWriter handles writing block-related data to Redis
@@ -323,4 +325,20 @@ func (w *RedisBlockWriter) WriteTransaction(txHash libcommon.Hash, blockNum uint
 	
 	w.logger.Debug("Transaction written to Redis", "hash", txHash.Hex(), "blockNum", blockNum)
 	return nil
+}
+
+// HandleTransaction processes a transaction and writes it to Redis
+// This is a convenience wrapper around WriteTransaction that accepts a transaction object
+func (w *RedisBlockWriter) HandleTransaction(tx types.Transaction, blockNum uint64) error {
+	// Get transaction hash
+	txHash := tx.Hash()
+	
+	// Marshal the transaction data
+	txData, err := json.Marshal(tx)
+	if err != nil {
+		return fmt.Errorf("failed to marshal transaction: %w", err)
+	}
+	
+	// Write the transaction using our existing method
+	return w.WriteTransaction(txHash, blockNum, txData)
 }
