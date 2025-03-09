@@ -371,13 +371,21 @@ func FinalizeBlockExecution(
 				}
 				
 				// Write change sets to Redis
+				fmt.Printf("REDIS_BLOCKCHAIN: Writing change sets for block %d\n", header.Number.Uint64())
 				if err := redisHistoryWriter.WriteChangeSets(); err != nil {
+					fmt.Printf("REDIS_BLOCKCHAIN_ERROR: Failed to write change sets to Redis for block %d: %v\n", header.Number.Uint64(), err)
 					logger.Warn("Failed to write Redis change sets", "err", err, "block", header.Number.Uint64())
+				} else {
+					fmt.Printf("REDIS_BLOCKCHAIN: Successfully wrote change sets for block %d\n", header.Number.Uint64())
 				}
 
 				// Write history to Redis
+				fmt.Printf("REDIS_BLOCKCHAIN: Writing history for block %d\n", header.Number.Uint64())
 				if err := redisHistoryWriter.WriteHistory(); err != nil {
+					fmt.Printf("REDIS_BLOCKCHAIN_ERROR: Failed to write history to Redis for block %d: %v\n", header.Number.Uint64(), err)
 					logger.Warn("Failed to write Redis history", "err", err, "block", header.Number.Uint64())
+				} else {
+					fmt.Printf("REDIS_BLOCKCHAIN: Successfully wrote history for block %d\n", header.Number.Uint64())
 				}
 			}
 		}

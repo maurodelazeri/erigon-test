@@ -22,6 +22,8 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"math/big"
+	"reflect"
 	"time"
 
 	"github.com/holiman/uint256"
@@ -135,39 +137,42 @@ func (w *RedisHistoricalWriter) GetBlockNum() uint64 {
 
 // WriteBlockStart writes the block start marker to Redis, initializing the block context
 func (w *RedisHistoricalWriter) WriteBlockStart(blockNum uint64) error {
+	// Add direct console logging for debugging
+	fmt.Printf("REDIS_WRITE: Starting new block %d\n", blockNum)
+
 	// Update current block number
 	w.blockNum = blockNum
 	w.txNum = 0 // Reset transaction counter at block start
-	
+
 	ctx, cancel := context.WithTimeout(w.ctx, 5*time.Second)
 	defer cancel()
-	
+
 	// Update the current block pointer
 	err := w.client.Set(ctx, "currentBlock", blockNum, 0).Err()
 	if err != nil {
 		return fmt.Errorf("failed to update current block: %w", err)
 	}
-	
+
 	// Create a block entry if it doesn't exist
 	blockKey := fmt.Sprintf("block:%d", blockNum)
 	exists, err := w.client.Exists(ctx, blockKey).Result()
 	if err != nil {
 		return fmt.Errorf("failed to check block existence: %w", err)
 	}
-	
+
 	if exists == 0 {
 		// Initialize block data structure
 		blockData := map[string]interface{}{
-			"number": blockNum,
+			"number":    blockNum,
 			"timestamp": time.Now().Unix(),
 		}
-		
+
 		err = w.client.HSet(ctx, blockKey, blockData).Err()
 		if err != nil {
 			return fmt.Errorf("failed to initialize block data: %w", err)
 		}
 	}
-	
+
 	return nil
 }
 
@@ -191,6 +196,9 @@ func (w *RedisStateWriter) DirectTestWrite(key string, value string) error {
 
 // WriteChangeSets writes change sets to Redis
 func (w *RedisHistoricalWriter) WriteChangeSets() error {
+	// Add direct console logging for debugging
+	fmt.Printf("REDIS_WRITE: Writing change sets for block %d\n", w.blockNum)
+
 	// For Redis implementation, most changes are written immediately
 	// However, we need to update canonical chain information to handle reorgs properly
 
@@ -240,6 +248,9 @@ func (w *RedisHistoricalWriter) WriteChangeSets() error {
 
 // WriteHistory writes history to Redis
 func (w *RedisHistoricalWriter) WriteHistory() error {
+	// Add direct console logging for debugging
+	fmt.Printf("REDIS_WRITE: Writing history for block %d\n", w.blockNum)
+
 	// For Redis implementation, we want to handle specifically marked blocks
 	// txNum == 0 is a special marker for blocks that have been reorged out
 	// or need special handling
@@ -264,55 +275,177 @@ func (w *RedisHistoricalWriter) WriteHistory() error {
 
 // StoreBlockInfo stores block header information in Redis
 func (w *RedisHistoricalWriter) StoreBlockInfo(headerInterface interface{}, root libcommon.Hash) error {
+	// Add direct console logging for debugging
+	fmt.Printf("REDIS_WRITE: Storing block info for block %d, root %s\n", w.blockNum, root.Hex())
+
 	// Extract relevant header information
 	headerJSON, err := json.Marshal(headerInterface)
 	if err != nil {
 		return fmt.Errorf("failed to marshal block header: %w", err)
 	}
-	
-	// Get header hash if available
+
+	// Attempt to extract common block header fields
+	var blockTime uint64
+	var difficulty *big.Int
+	var gasLimit uint64
+	var gasUsed uint64
+	var parentHash libcommon.Hash
+	var coinbase libcommon.Address
+	var extraData []byte
+	var baseFee *big.Int
+
+	// Extract header hash if available
 	var headerHash string
 	if header, ok := headerInterface.(interface{ Hash() libcommon.Hash }); ok {
 		headerHash = header.Hash().Hex()
 	}
-	
+
+	// Try to extract common header fields using reflection to avoid type dependencies
+	headerVal := reflect.ValueOf(headerInterface)
+	if headerVal.Kind() == reflect.Ptr {
+		headerVal = headerVal.Elem()
+	}
+
+	// Only proceed if we have a struct
+	if headerVal.Kind() == reflect.Struct {
+		// Extract Time field
+		if timeField := headerVal.FieldByName("Time"); timeField.IsValid() {
+			blockTime = timeField.Uint()
+		}
+
+		// Extract Difficulty field
+		if diffField := headerVal.FieldByName("Difficulty"); diffField.IsValid() {
+			if diff, ok := diffField.Interface().(*big.Int); ok && diff != nil {
+				difficulty = diff
+			}
+		}
+
+		// Extract GasLimit field
+		if gasLimitField := headerVal.FieldByName("GasLimit"); gasLimitField.IsValid() {
+			gasLimit = gasLimitField.Uint()
+		}
+
+		// Extract GasUsed field
+		if gasUsedField := headerVal.FieldByName("GasUsed"); gasUsedField.IsValid() {
+			gasUsed = gasUsedField.Uint()
+		}
+
+		// Extract ParentHash field
+		if parentHashField := headerVal.FieldByName("ParentHash"); parentHashField.IsValid() {
+			if hash, ok := parentHashField.Interface().(libcommon.Hash); ok {
+				parentHash = hash
+			}
+		}
+
+		// Extract Coinbase field
+		if coinbaseField := headerVal.FieldByName("Coinbase"); coinbaseField.IsValid() {
+			if addr, ok := coinbaseField.Interface().(libcommon.Address); ok {
+				coinbase = addr
+			}
+		}
+
+		// Extract ExtraData field
+		if extraDataField := headerVal.FieldByName("Extra"); extraDataField.IsValid() {
+			if data, ok := extraDataField.Interface().([]byte); ok {
+				extraData = data
+			}
+		}
+
+		// Extract BaseFee field (EIP-1559)
+		if baseFeeField := headerVal.FieldByName("BaseFee"); baseFeeField.IsValid() && !baseFeeField.IsNil() {
+			if fee, ok := baseFeeField.Interface().(*big.Int); ok && fee != nil {
+				baseFee = fee
+			}
+		}
+	}
+
 	ctx, cancel := context.WithTimeout(w.ctx, 5*time.Second)
 	defer cancel()
-	
+
 	// Store block information
 	blockKey := fmt.Sprintf("block:%d", w.blockNum)
-	
+
 	// Create a block data structure with current information
 	blockData := map[string]interface{}{
-		"number":     w.blockNum,
-		"timestamp":  time.Now().Unix(),
-		"header":     string(headerJSON),
-		"stateRoot":  root.Hex(),
-		"headerHash": headerHash,
+		"number":      w.blockNum,
+		"timestamp":   blockTime,
+		"header":      string(headerJSON),
+		"stateRoot":   root.Hex(),
+		"headerHash":  headerHash,
+		"parentHash":  parentHash.Hex(),
+		"gasLimit":    gasLimit,
+		"gasUsed":     gasUsed,
+		"indexedTime": time.Now().Unix(), // When we indexed this block
 	}
-	
+
+	if difficulty != nil {
+		blockData["difficulty"] = difficulty.String()
+	}
+
+	if baseFee != nil {
+		blockData["baseFee"] = baseFee.String()
+	}
+
+	if coinbase != (libcommon.Address{}) {
+		blockData["coinbase"] = coinbase.Hex()
+	}
+
+	if len(extraData) > 0 {
+		blockData["extraData"] = libcommon.Bytes2Hex(extraData)
+	}
+
+	// Store detailed block info
+	blockInfoKey := fmt.Sprintf("blockinfo:%d", w.blockNum)
+	if err := w.client.HSet(ctx, blockInfoKey, blockData).Err(); err != nil {
+		w.logger.Warn("Failed to store detailed block info", "block", w.blockNum, "err", err)
+		// Non-fatal error, continue processing
+	}
+
 	if headerHash != "" {
 		// Store hash to block number mapping
 		blockHashKey := fmt.Sprintf("blockHash:%s", headerHash)
 		err = w.client.HSet(ctx, blockHashKey, map[string]interface{}{
 			"number":    w.blockNum,
-			"timestamp": time.Now().Unix(),
+			"timestamp": blockTime,
+			"canonical": true,
 		}).Err()
-		
+
 		if err != nil {
 			return fmt.Errorf("failed to store block hash mapping: %w", err)
 		}
-		
+
 		// Also set hash field in the block entry
 		blockData["hash"] = headerHash
+
+		// Add to latest blocks index (with score as block number for ordering)
+		latestBlocksKey := "blocks:latest"
+		err = w.client.ZAdd(ctx, latestBlocksKey, redis.Z{
+			Score:  float64(w.blockNum),
+			Member: headerHash,
+		}).Err()
+		if err != nil {
+			w.logger.Warn("Failed to add block to latest blocks index", "block", w.blockNum, "err", err)
+		}
+
+		// Index block by miner/coinbase
+		if coinbase != (libcommon.Address{}) {
+			minerBlocksKey := fmt.Sprintf("miner:%s:blocks", coinbase.Hex())
+			err = w.client.ZAdd(ctx, minerBlocksKey, redis.Z{
+				Score:  float64(w.blockNum),
+				Member: headerHash,
+			}).Err()
+			if err != nil {
+				w.logger.Warn("Failed to index block by miner", "miner", coinbase.Hex(), "err", err)
+			}
+		}
 	}
-	
+
 	// Store actual block data
 	err = w.client.HSet(ctx, blockKey, blockData).Err()
 	if err != nil {
 		return fmt.Errorf("failed to store block data: %w", err)
 	}
-	
+
 	return nil
 }
 
@@ -509,10 +642,14 @@ func (w *RedisStateWriter) UpdateAccountData(address libcommon.Address, original
 		return errors.New("account cannot be nil")
 	}
 
+	// Add direct console logging for debugging
+	fmt.Printf("REDIS_WRITE: Updating account data for %s at block %d, nonce: %d, balance: %s\n",
+		address.Hex(), w.blockNum, account.Nonce, account.Balance.Hex())
+
 	// Add detailed debug logging
-	w.logger.Debug("Redis: Updating account data", 
-		"block", w.blockNum, 
-		"address", address.Hex(), 
+	w.logger.Info("Redis: Updating account data",
+		"block", w.blockNum,
+		"address", address.Hex(),
 		"nonce", account.Nonce,
 		"balance", account.Balance.Hex(),
 		"codeHash", account.CodeHash.Hex())
@@ -540,15 +677,15 @@ func (w *RedisStateWriter) UpdateAccountData(address libcommon.Address, original
 	})
 
 	if cmd.Err() != nil {
-		w.logger.Error("Redis: Failed to update account data", 
-			"address", address.Hex(), 
-			"block", w.blockNum, 
+		w.logger.Error("Redis: Failed to update account data",
+			"address", address.Hex(),
+			"block", w.blockNum,
 			"err", cmd.Err())
 		return fmt.Errorf("redis error updating account data for %s: %w", address.Hex(), cmd.Err())
 	}
 
-	w.logger.Debug("Redis: Successfully updated account data", 
-		"address", address.Hex(), 
+	w.logger.Debug("Redis: Successfully updated account data",
+		"address", address.Hex(),
 		"block", w.blockNum)
 	return nil
 }
@@ -559,6 +696,10 @@ func (w *RedisStateWriter) UpdateAccountCode(address libcommon.Address, incarnat
 	if len(code) == 0 {
 		return nil
 	}
+
+	// Add direct console logging for debugging
+	fmt.Printf("REDIS_WRITE: Updating code for address %s, codeHash %s, code length %d at block %d\n",
+		address.Hex(), codeHash.Hex(), len(code), w.blockNum)
 
 	ctx, cancel := context.WithTimeout(w.ctx, 5*time.Second)
 	defer cancel()
@@ -590,6 +731,10 @@ func (w *RedisStateWriter) UpdateAccountCode(address libcommon.Address, incarnat
 
 // HandleTransaction stores transaction data in Redis
 func (w *RedisStateWriter) HandleTransaction(tx types.Transaction, receipt *types.Receipt, blockNum uint64, txIndex uint64) error {
+	// Add direct console logging for debugging
+	fmt.Printf("REDIS_WRITE: Handling transaction %s at block %d, txIndex %d\n",
+		tx.Hash().Hex(), blockNum, txIndex)
+
 	ctx, cancel := context.WithTimeout(w.ctx, 5*time.Second)
 	defer cancel()
 
@@ -610,9 +755,12 @@ func (w *RedisStateWriter) HandleTransaction(tx types.Transaction, receipt *type
 		return fmt.Errorf("redis error storing transaction %s: %w", txHash.Hex(), err)
 	}
 
-	// Add transaction to block's transaction list
+	// Add transaction to block's transaction list with ordering by index
 	blockTxsKey := fmt.Sprintf("block:%d:txs", blockNum)
-	err = w.client.SAdd(ctx, blockTxsKey, txHash.Hex()).Err()
+	err = w.client.ZAdd(ctx, blockTxsKey, redis.Z{
+		Score:  float64(txIndex), // Use txIndex as score for proper ordering
+		Member: txHash.Hex(),
+	}).Err()
 	if err != nil {
 		return fmt.Errorf("redis error adding transaction to block: %w", err)
 	}
@@ -631,6 +779,88 @@ func (w *RedisStateWriter) HandleTransaction(tx types.Transaction, receipt *type
 		}
 	}
 
+	// Also store recipient for contract creation or normal transactions
+	var to *libcommon.Address
+	// Try to get recipient safely, using reflection to avoid interface incompatibilities
+	txVal := reflect.ValueOf(tx)
+	if txVal.Kind() == reflect.Ptr {
+		txVal = txVal.Elem()
+	}
+	
+	// Check if the tx has a To method
+	toMethod := reflect.ValueOf(tx).MethodByName("To")
+	if toMethod.IsValid() {
+		// Call the To method
+		result := toMethod.Call(nil)
+		if len(result) > 0 && !result[0].IsNil() {
+			if toAddr, ok := result[0].Interface().(*libcommon.Address); ok && toAddr != nil {
+				to = toAddr
+				// Add transaction to recipient's received txs list
+				recipientTxsKey := fmt.Sprintf("recipient:%s:txs", to.Hex())
+				err = w.client.ZAdd(ctx, recipientTxsKey, redis.Z{
+					Score:  float64(blockNum),
+					Member: txHash.Hex(),
+				}).Err()
+				if err != nil {
+					w.logger.Warn("Failed to add transaction to recipient list", "recipient", to.Hex(), "err", err)
+					// Non-fatal error, continue processing
+				}
+			}
+		}
+	}
+	
+	// Store transaction data directly in a hash for easier retrieval
+	txInfoKey := fmt.Sprintf("txinfo:%s", txHash.Hex())
+	txInfo := map[string]interface{}{
+		"hash":      txHash.Hex(),
+		"blockNum":  blockNum,
+		"txIndex":   txIndex,
+		"timestamp": time.Now().Unix(), // For approximate timing
+	}
+	
+	// Get gas using reflection if available
+	gasMethod := reflect.ValueOf(tx).MethodByName("Gas")
+	if gasMethod.IsValid() {
+		result := gasMethod.Call(nil)
+		if len(result) > 0 {
+			txInfo["gas"] = result[0].Uint()
+		}
+	}
+	
+	// Get gas price using reflection if available
+	gasPriceMethod := reflect.ValueOf(tx).MethodByName("GasPrice")
+	if gasPriceMethod.IsValid() {
+		result := gasPriceMethod.Call(nil)
+		if len(result) > 0 && !result[0].IsNil() {
+			if bigInt, ok := result[0].Interface().(*big.Int); ok && bigInt != nil {
+				txInfo["gasPrice"] = bigInt.String()
+			}
+		}
+	}
+	
+	// Get value using reflection if available
+	valueMethod := reflect.ValueOf(tx).MethodByName("Value")
+	if valueMethod.IsValid() {
+		result := valueMethod.Call(nil)
+		if len(result) > 0 && !result[0].IsNil() {
+			if bigInt, ok := result[0].Interface().(*big.Int); ok && bigInt != nil {
+				txInfo["value"] = bigInt.String()
+			}
+		}
+	}
+	
+	if sender, ok := tx.GetSender(); ok {
+		txInfo["from"] = sender.Hex()
+	}
+	if to != nil {
+		txInfo["to"] = to.Hex()
+	}
+	
+	if err := w.client.HSet(ctx, txInfoKey, txInfo).Err(); err != nil {
+		w.logger.Warn("Failed to store transaction info", "tx", txHash.Hex(), "err", err)
+		// Non-fatal error, continue processing
+	}
+
 	// If we have a receipt, store it as well
 	if receipt != nil {
 		err = w.StoreReceipt(txHash, receipt, blockNum, txIndex)
@@ -646,6 +876,10 @@ func (w *RedisStateWriter) HandleTransaction(tx types.Transaction, receipt *type
 func (w *RedisStateWriter) StoreReceipt(txHash libcommon.Hash, receipt *types.Receipt, blockNum uint64, txIndex uint64) error {
 	ctx, cancel := context.WithTimeout(w.ctx, 5*time.Second)
 	defer cancel()
+
+	// Add direct console logging for debugging
+	fmt.Printf("REDIS_WRITE: Storing receipt for tx %s at block %d, txIndex %d, status: %d, gasUsed: %d, logs: %d\n",
+		txHash.Hex(), blockNum, txIndex, receipt.Status, receipt.GasUsed, len(receipt.Logs))
 
 	// Serialize the receipt to JSON
 	receiptData, err := json.Marshal(receipt)
@@ -672,11 +906,50 @@ func (w *RedisStateWriter) StoreReceipt(txHash libcommon.Hash, receipt *types.Re
 	if err != nil {
 		return fmt.Errorf("redis error adding receipt to block: %w", err)
 	}
+	
+	// Store receipt data directly in a hash for easier retrieval
+	receiptInfoKey := fmt.Sprintf("receiptinfo:%s", txHash.Hex())
+	receiptInfo := map[string]interface{}{
+		"txHash":    txHash.Hex(),
+		"blockNum":  blockNum,
+		"txIndex":   txIndex,
+		"status":    receipt.Status,
+		"gasUsed":   receipt.GasUsed,
+		"logsCount": len(receipt.Logs),
+		"timestamp": time.Now().Unix(), // For approximate timing
+	}
+	
+	if receipt.ContractAddress != (libcommon.Address{}) {
+		receiptInfo["contractAddress"] = receipt.ContractAddress.Hex()
+		
+		// Add special index for contract creation events
+		contractCreationKey := fmt.Sprintf("contracts:created")
+		err = w.client.ZAdd(ctx, contractCreationKey, redis.Z{
+			Score:  float64(blockNum),
+			Member: receipt.ContractAddress.Hex(),
+		}).Err()
+		if err != nil {
+			w.logger.Warn("Failed to index contract creation", "contract", receipt.ContractAddress.Hex(), "err", err)
+			// Non-fatal error, continue processing
+		}
+	}
+	
+	if err := w.client.HSet(ctx, receiptInfoKey, receiptInfo).Err(); err != nil {
+		w.logger.Warn("Failed to store receipt info", "tx", txHash.Hex(), "err", err)
+		// Non-fatal error, continue processing
+	}
 
 	// For each log, store it in the logs by topic index
 	for _, log := range receipt.Logs {
-		// Store log by its index
+		// Store log by its index with transaction context
 		logKey := fmt.Sprintf("log:%d", log.Index)
+		
+		// Enhance log with transaction information
+		// This makes logs self-contained with all reference information
+		log.TxHash = txHash
+		log.BlockNumber = blockNum
+		log.TxIndex = uint(txIndex)
+		
 		logData, err := json.Marshal(log)
 		if err != nil {
 			w.logger.Warn("Failed to marshal log", "log", log.Index, "err", err)
@@ -688,9 +961,44 @@ func (w *RedisStateWriter) StoreReceipt(txHash libcommon.Hash, receipt *types.Re
 			w.logger.Warn("Failed to store log", "log", log.Index, "err", err)
 			continue
 		}
+		
+		// Create a log hash key for the full log info to avoid duplication
+		logDataKey := fmt.Sprintf("loginfo:%d", log.Index)
+		logInfo := map[string]interface{}{
+			"txHash":      txHash.Hex(),
+			"blockNum":    blockNum,
+			"txIndex":     txIndex,
+			"logIndex":    log.Index,
+			"address":     log.Address.Hex(),
+			"data":        libcommon.Bytes2Hex(log.Data),
+			"timestamp":   time.Now().Unix(),
+		}
+		
+		// Add topics individually
+		for i, topic := range log.Topics {
+			topicKey := fmt.Sprintf("topic%d", i)
+			logInfo[topicKey] = topic.Hex()
+		}
+		
+		if err := w.client.HSet(ctx, logDataKey, logInfo).Err(); err != nil {
+			w.logger.Warn("Failed to store log info", "log", log.Index, "err", err)
+			// Non-fatal error, continue processing
+		}
 
-		// Index logs by topic
-		for _, topic := range log.Topics {
+		// Index logs by each topic (allows searching by ANY topic)
+		for i, topic := range log.Topics {
+			// Index by specific topic position (topic0, topic1, ...)
+			topicPosKey := fmt.Sprintf("topic%d:%s", i, topic.Hex())
+			err = w.client.ZAdd(ctx, topicPosKey, redis.Z{
+				Score:  float64(blockNum),
+				Member: fmt.Sprintf("%d", log.Index),
+			}).Err()
+			if err != nil {
+				w.logger.Warn("Failed to index log by topic position", 
+					"position", i, "topic", topic.Hex(), "err", err)
+			}
+			
+			// Index by any topic position (for general topic searches)
 			topicKey := fmt.Sprintf("topic:%s", topic.Hex())
 			err = w.client.ZAdd(ctx, topicKey, redis.Z{
 				Score:  float64(blockNum),
@@ -709,6 +1017,16 @@ func (w *RedisStateWriter) StoreReceipt(txHash libcommon.Hash, receipt *types.Re
 		}).Err()
 		if err != nil {
 			w.logger.Warn("Failed to index log by address", "address", log.Address.Hex(), "err", err)
+		}
+		
+		// Index transactions that emitted logs
+		txWithLogsKey := fmt.Sprintf("txs:with:logs")
+		err = w.client.ZAdd(ctx, txWithLogsKey, redis.Z{
+			Score:  float64(blockNum),
+			Member: txHash.Hex(),
+		}).Err()
+		if err != nil {
+			w.logger.Warn("Failed to index tx with logs", "tx", txHash.Hex(), "err", err)
 		}
 	}
 
@@ -749,6 +1067,10 @@ func (w *RedisStateWriter) DeleteAccount(address libcommon.Address, original *ac
 
 // WriteAccountStorage writes account storage to Redis
 func (w *RedisStateWriter) WriteAccountStorage(address libcommon.Address, incarnation uint64, key *libcommon.Hash, original, value *uint256.Int) error {
+	// Add direct console logging for debugging
+	fmt.Printf("REDIS_WRITE: Writing storage for address %s, key %s at block %d\n",
+		address.Hex(), key.Hex(), w.blockNum)
+
 	ctx, cancel := context.WithTimeout(w.ctx, 5*time.Second)
 	defer cancel()
 

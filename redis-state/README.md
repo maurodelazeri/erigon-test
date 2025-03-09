@@ -10,6 +10,7 @@ The Redis state integration allows Erigon to write all blockchain data to Redis 
 2. **Complete Blockchain Data**: Store accounts, storage, code, transactions, receipts, logs, and blocks
 3. **Real-time Updates**: Data is written to Redis as blocks are processed
 4. **Chain Reorganization Handling**: Proper tracking of canonical chain during reorgs
+5. **Simple Configuration**: Just provide a Redis URL and the integration is automatically enabled
 
 ## Data Storage Model
 
@@ -84,7 +85,8 @@ The Redis integration is structured with these key components:
 1. **RedisStateReader**: Reads state from Redis at specific block heights
 2. **RedisStateWriter**: Writes account and storage state to Redis
 3. **RedisHistoricalWriter**: Adds block and history tracking capabilities
-4. **Factory Pattern**: Creates appropriate writers per block
+4. **RedisWriterAdapter**: Bridges between core/state and redis-state packages
+5. **Factory Pattern**: Creates appropriate writers per block
 
 ## Integration Points
 
@@ -95,19 +97,28 @@ The Redis integration hooks into Erigon's execution flow at these critical point
 **File**: `eth/backend.go`
 
 ```go
-// Initialize Redis if enabled
-if stack.Config().Redis.Enabled {
+// Initialize Redis if URL is provided
+if stack.Config().Redis.URL != "" {
     logger.Info("Initializing Redis state integration", "url", stack.Config().Redis.URL)
     if err := redisstate.InitializeRedisClient(context.Background(), stack.Config().Redis.URL, stack.Config().Redis.Password, logger); err != nil {
         logger.Warn("Failed to initialize Redis client", "err", err)
     } else {
-        // Register the Redis writer factory with core state
+        // Create and register the Redis writer factory with the state package
         writerFactoryFn := redisstate.GetRedisWriterFactoryFn()
         state.SetRedisWriterFactory(writerFactoryFn)
 
-        // Verify Redis connection
+        // Verify Redis connection and initialization
         diagnostics := redisstate.DiagnoseRedisConnection()
-        logger.Info("Redis integration initialized", "status", diagnostics["status"])
+        if diagnostics["status"] == "connected" {
+            logger.Info("Redis state integration initialized and verified",
+                "address", diagnostics["address"],
+                "connected", diagnostics["status"] == "connected",
+                "write_success", diagnostics["write_success"])
+        } else {
+            logger.Error("Redis connection verified but may have issues",
+                "status", diagnostics["status"],
+                "error", diagnostics["error"])
+        }
     }
 }
 ```
@@ -283,6 +294,20 @@ Contains the implementation of Redis state readers and writers:
    - `WriteChangeSets` - Updates canonical chain
    - `WriteHistory` - Handles special cases like reorgs
 
+### bridge.go
+
+Implements the adapter between the redis-state and core/state packages:
+
+1. **Type Adaptation**:
+
+   - `RedisWriterAdapter` - Adapts between different interface expectations
+   - Handles type conversions for all state operations
+   - Provides detailed logging for troubleshooting
+
+2. **Factory Registration**:
+   - `adapterFactoryFn` - Creates properly adapted writers for each block
+   - Maps between the core/state and redis-state type systems
+
 ### factory.go
 
 Manages Redis client and writer lifecycle:
@@ -320,11 +345,13 @@ Implements provider interfaces for RPC access:
 
 ## Configuration and Usage
 
-To enable Redis integration, add these flags to your Erigon command:
+To enable Redis integration, simply provide a Redis URL in your Erigon command:
 
 ```bash
-erigon --redis.enabled=true --redis.url="redis://localhost:6379/0" --redis.password="password" [other flags]
+erigon --redis.url="redis://localhost:6379/0" --redis.password="password" [other flags]
 ```
+
+The integration is automatically enabled whenever the Redis URL is provided.
 
 ## Verification
 
@@ -362,19 +389,27 @@ redis-cli -a password MONITOR
 
 1. **No Data in Redis**:
 
-   - Verify Redis connection is successful in logs
-   - Check if Redis is enabled with the correct flags
+   - Check the logs for messages starting with `REDIS_ADAPTER:` to see what's being written
+   - Verify that the Redis URL is correct and the server is accessible
    - Ensure Erigon is processing new blocks (not idle)
+   - Look for `REDIS_ADAPTER_ERROR` messages that might indicate conversion problems
 
 2. **Missing Data Types**:
 
    - If accounts appear but no transactions, check `HandleTransaction` integration
    - If blocks appear but no state, check `CommitBlock` integration
+   - Look for type conversion errors in the logs which might indicate incompatible interfaces
 
 3. **Performance Issues**:
+
    - Enable pipelining for better performance
    - Consider Redis cluster for large-scale deployments
    - Implement pruning for historical data
+   - Monitor the memory usage of your Redis instance
+
+4. **Interface Compatibility Issues**:
+   - The adapter logs detailed information about type conversions
+   - If you see frequent conversion warnings, you may need to update the adapter's type handling
 
 ## Extending the Integration
 

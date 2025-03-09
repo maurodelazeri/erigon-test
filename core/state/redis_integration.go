@@ -18,12 +18,13 @@ package state
 
 import (
 	"context"
+	"fmt"
 	"sync"
 
 	"github.com/redis/go-redis/v9"
 
-	"github.com/erigontech/erigon-lib/log/v3"
 	libcommon "github.com/erigontech/erigon-lib/common"
+	"github.com/erigontech/erigon-lib/log/v3"
 )
 
 // redisWriterFactory is a function type for creating Redis writers
@@ -53,13 +54,13 @@ var (
 	redisStateWriter     StateWriter
 	redisHistoryWriter   RedisWriter
 	redisIntegrationOnce sync.Once
-	
+
 	// Factory function to create Redis writers - will be set by the redis-state package
 	redisWriterFactoryFn redisWriterFactory
-	
+
 	// Instance cache to avoid creating new instances for the same block
-	redisWriterCache     map[uint64]RedisWriter
-	redisWriterCacheMux  sync.RWMutex
+	redisWriterCache    map[uint64]RedisWriter
+	redisWriterCacheMux sync.RWMutex
 )
 
 func init() {
@@ -107,14 +108,23 @@ func SetRedisWriterFactory(factory interface{}) {
 		redisWriterFactoryFn = func(blockNum uint64) RedisWriter {
 			writer := fn(blockNum)
 			if writer == nil {
+				fmt.Printf("REDIS_STATE_ERROR: Factory returned nil writer for block %d\n", blockNum)
 				return nil
 			}
-			
-			// Try to cast to RedisWriter
+
+			// Try to cast to RedisHistoricalWriter first (preferred)
+			if historyWriter, ok := writer.(RedisHistoricalWriter); ok {
+				fmt.Printf("REDIS_STATE: Factory returned RedisHistoricalWriter for block %d\n", blockNum)
+				return historyWriter
+			}
+
+			// Fall back to RedisWriter
 			if redisWriter, ok := writer.(RedisWriter); ok {
+				fmt.Printf("REDIS_STATE: Factory returned RedisWriter for block %d\n", blockNum)
 				return redisWriter
 			}
-			
+
+			fmt.Printf("REDIS_STATE_ERROR: Factory returned unrecognized type for block %d: %T\n", blockNum, writer)
 			return nil
 		}
 	}
@@ -130,26 +140,26 @@ func GetRedisStateWriter(blockNum uint64) RedisWriter {
 	redisWriterCacheMux.RLock()
 	writer, exists := redisWriterCache[blockNum]
 	redisWriterCacheMux.RUnlock()
-	
+
 	if exists {
 		return writer
 	}
-	
+
 	// Create new writer with write lock
 	redisWriterCacheMux.Lock()
 	defer redisWriterCacheMux.Unlock()
-	
+
 	// Double-check pattern
 	if writer, exists = redisWriterCache[blockNum]; exists {
 		return writer
 	}
-	
+
 	// Call factory method to create writer
 	writer = redisWriterFactoryFn(blockNum)
 	if writer != nil {
 		redisWriterCache[blockNum] = writer
 	}
-	
+
 	return writer
 }
 
@@ -157,7 +167,7 @@ func GetRedisStateWriter(blockNum uint64) RedisWriter {
 func ClearRedisWriterCache() {
 	redisWriterCacheMux.Lock()
 	defer redisWriterCacheMux.Unlock()
-	
+
 	// Clear cache
 	redisWriterCache = make(map[uint64]RedisWriter)
 }
@@ -184,7 +194,7 @@ func ShutdownRedis() {
 		redisClient.Close()
 		redisClient = nil
 	}
-	
+
 	// Clear cache
 	ClearRedisWriterCache()
 }

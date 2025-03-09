@@ -338,9 +338,8 @@ func (c *Config) parsePersistentNodes(w *bool, path string, logger log.Logger) [
 
 // RedisConfig holds Redis-related configuration
 type RedisConfig struct {
-	// Enabled indicates if Redis state persistence is enabled
-	Enabled bool
 	// URL is the Redis connection URL
+	// Redis is automatically enabled when URL is not empty
 	URL string
 	// Password for Redis authentication
 	Password string

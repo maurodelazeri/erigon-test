@@ -39,9 +39,13 @@ var (
 
 // InitializeRedisClient creates a Redis client and registers the state writer
 func InitializeRedisClient(ctx context.Context, url, password string, logger log.Logger) error {
+	// Add direct console logging for debugging
+	fmt.Printf("REDIS_INIT: Initializing Redis client with URL: %s\n", url)
+	
 	// Parse Redis URL
 	opts, err := redis.ParseURL(url)
 	if err != nil {
+		fmt.Printf("REDIS_ERROR: Failed to parse Redis URL: %s, error: %v\n", url, err)
 		logger.Error("Failed to parse Redis URL", "url", url, "err", err)
 		return err
 	}
@@ -54,27 +58,43 @@ func InitializeRedisClient(ctx context.Context, url, password string, logger log
 	// Create Redis client
 	globalRedisClient = redis.NewClient(opts)
 	globalRedisCtx = ctx
+	
+	// Explicitly initialize the Redis client in the core/state package for backward compatibility
+	// This is critical for state.IsRedisEnabled() to work properly
+	if err := state.InitializeRedisClient(ctx, url, password, logger); err != nil {
+		fmt.Printf("REDIS_ERROR: Failed to initialize Redis client in core/state package: %v\n", err)
+		logger.Error("Failed to initialize Redis client in core/state package", "err", err)
+		// Don't return error - continue with our Redis client which is initialized
+	} else {
+		fmt.Printf("REDIS_INIT: Successfully initialized Redis client in both packages\n")
+	}
 
 	// Test connection
 	if err := globalRedisClient.Ping(ctx).Err(); err != nil {
+		fmt.Printf("REDIS_ERROR: Failed to connect to Redis: %v\n", err)
 		logger.Error("Failed to connect to Redis", "err", err)
 		return err
 	}
+	fmt.Printf("REDIS_SUCCESS: Successfully connected to Redis\n")
 
 	// Write a test value to verify write access
 	testKey := "erigon:redis_test"
 	testValue := "Redis integration active: " + time.Now().Format(time.RFC3339)
 	if err := globalRedisClient.Set(ctx, testKey, testValue, 24*time.Hour).Err(); err != nil {
+		fmt.Printf("REDIS_ERROR: Failed to write test data to Redis: %v\n", err)
 		logger.Error("Failed to write test data to Redis", "err", err)
 		return err
 	}
+	fmt.Printf("REDIS_SUCCESS: Successfully wrote test value to Redis\n")
 	
 	// Read the test value back
 	val, err := globalRedisClient.Get(ctx, testKey).Result()
 	if err != nil {
+		fmt.Printf("REDIS_ERROR: Failed to read test data from Redis: %v\n", err)
 		logger.Error("Failed to read test data from Redis", "err", err)
 		return err
 	}
+	fmt.Printf("REDIS_SUCCESS: Successfully read test value from Redis\n")
 	
 	logger.Info("Successfully connected to Redis with read/write access", "url", url, "test_value", val)
 	
@@ -84,9 +104,11 @@ func InitializeRedisClient(ctx context.Context, url, password string, logger log
 	
 	// Test writing a block
 	if err := testWriter.WriteBlockStart(testBlockNum); err != nil {
+		fmt.Printf("REDIS_ERROR: Failed to write test block to Redis: %v\n", err)
 		logger.Error("Failed to write test block to Redis", "err", err)
 		return fmt.Errorf("Redis connection successful but unable to write block data: %w", err)
 	}
+	fmt.Printf("REDIS_SUCCESS: Successfully wrote test block to Redis\n")
 	
 	// Test writing some state data
 	testAddress := libcommon.HexToAddress("0x0000000000000000000000000000000000000001")
@@ -97,9 +119,43 @@ func InitializeRedisClient(ctx context.Context, url, password string, logger log
 	}
 	
 	if err := testWriter.UpdateAccountData(testAddress, nil, testAccount); err != nil {
+		fmt.Printf("REDIS_ERROR: Failed to write test account data to Redis: %v\n", err)
 		logger.Error("Failed to write test account data to Redis", "err", err)
 		return fmt.Errorf("Redis connection successful but unable to write account data: %w", err)
 	}
+	fmt.Printf("REDIS_SUCCESS: Successfully wrote test account data to Redis\n")
+	
+	// Test writing storage data
+	testStorageKey := libcommon.HexToHash("0x0000000000000000000000000000000000000000000000000000000000000001")
+	testStorageValue := uint256.NewInt(42)
+	if err := testWriter.WriteAccountStorage(testAddress, 1, &testStorageKey, nil, testStorageValue); err != nil {
+		fmt.Printf("REDIS_ERROR: Failed to write test storage data to Redis: %v\n", err)
+		logger.Error("Failed to write test storage data to Redis", "err", err)
+		return fmt.Errorf("Redis connection successful but unable to write storage data: %w", err)
+	}
+	fmt.Printf("REDIS_SUCCESS: Successfully wrote test storage data to Redis\n")
+	
+	// Test writing a block header
+	testHeader := map[string]interface{}{
+		"number":     testBlockNum,
+		"timestamp":  uint64(time.Now().Unix()),
+		"parentHash": libcommon.Hash{}.Hex(),
+		"root":       libcommon.Hash{}.Hex(),
+	}
+	if err := testWriter.StoreBlockInfo(testHeader, libcommon.Hash{}); err != nil {
+		fmt.Printf("REDIS_ERROR: Failed to write test block header to Redis: %v\n", err)
+		logger.Error("Failed to write test block header to Redis", "err", err)
+		return fmt.Errorf("Redis connection successful but unable to write block header: %w", err)
+	}
+	fmt.Printf("REDIS_SUCCESS: Successfully wrote test block header to Redis\n")
+	
+	// Test writing change sets
+	if err := testWriter.WriteChangeSets(); err != nil {
+		fmt.Printf("REDIS_ERROR: Failed to write test change sets to Redis: %v\n", err)
+		logger.Error("Failed to write test change sets to Redis", "err", err)
+		return fmt.Errorf("Redis connection successful but unable to write change sets: %w", err)
+	}
+	fmt.Printf("REDIS_SUCCESS: Successfully wrote test change sets to Redis\n")
 	
 	logger.Info("Redis integration fully verified", 
 		"url", url, 
@@ -112,7 +168,27 @@ func InitializeRedisClient(ctx context.Context, url, password string, logger log
 	
 	// Also register with core state package
 	writerFactoryFn := func(blockNum uint64) interface{} {
-		return factory.Get(globalRedisClient, blockNum)
+		// Get a RedisHistoricalWriter instance
+		writer := factory.Get(globalRedisClient, blockNum)
+		if writer == nil {
+			fmt.Printf("REDIS_STATE: Failed to create Redis writer for block %d\n", blockNum)
+			return nil
+		}
+		
+		// Create an adapter that implements state.RedisHistoricalWriter
+		adapter := &RedisWriterAdapter{
+			Writer: writer,
+			Logger: logger,
+		}
+		
+		fmt.Printf("REDIS_STATE: Setting block context for block %d\n", blockNum)
+		
+		// Verify that we're returning a proper state.RedisHistoricalWriter interface
+		// This creates a compile-time guarantee that the adapter implements the interface
+		var verifiedWriter state.RedisHistoricalWriter = adapter
+		
+		// Return the verified interface - critical to return the interface type, not the concrete type
+		return verifiedWriter
 	}
 	
 	// Set the factory function for the state package
