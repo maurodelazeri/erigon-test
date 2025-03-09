@@ -38,7 +38,7 @@ type RedisStateReader struct {
 	client   *redis.Client
 	ctx      context.Context
 	logger   log.Logger
-	blockNum uint64  // For point-in-time queries, 0 means latest
+	blockNum uint64 // For point-in-time queries, 0 means latest
 }
 
 // RedisStateWriter implements the state.StateWriter interface using Redis as the backing store
@@ -135,6 +135,14 @@ func (w *RedisStateWriter) GetTxNum() uint64 {
 	return w.txNum
 }
 
+// DirectTestWrite is a simple test method that writes directly to Redis
+func (w *RedisStateWriter) DirectTestWrite(key string, value string) error {
+	ctx, cancel := context.WithTimeout(w.ctx, 5*time.Second)
+	defer cancel()
+
+	return w.client.Set(ctx, key, value, 24*time.Hour).Err()
+}
+
 // WriteChangeSets writes change sets to Redis
 func (w *RedisHistoricalWriter) WriteChangeSets() error {
 	// No-op for Redis implementation as changes are written immediately
@@ -166,7 +174,7 @@ func codeKey(codeHash libcommon.Hash) string {
 func (r *RedisStateReader) ReadAccountDataAtBlock(address libcommon.Address, blockNum uint64) (*accounts.Account, error) {
 	ctx, cancel := context.WithTimeout(r.ctx, 5*time.Second)
 	defer cancel()
-	
+
 	key := accountKey(address)
 
 	// Get the most recent account data before or at the specified block
@@ -226,7 +234,7 @@ func (r *RedisStateReader) ReadAccountDataForDebug(address libcommon.Address) (*
 func (r *RedisStateReader) ReadAccountStorageAtBlock(address libcommon.Address, incarnation uint64, key *libcommon.Hash, blockNum uint64) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(r.ctx, 5*time.Second)
 	defer cancel()
-	
+
 	storageKeyStr := storageKey(address, key)
 
 	// Get the most recent storage data before or at the specified block
@@ -241,7 +249,7 @@ func (r *RedisStateReader) ReadAccountStorageAtBlock(address libcommon.Address, 
 		if result.Err() == redis.Nil {
 			return nil, nil // Storage doesn't exist
 		}
-		return nil, fmt.Errorf("redis error reading storage %s at block %d: %w", 
+		return nil, fmt.Errorf("redis error reading storage %s at block %d: %w",
 			storageKeyStr, blockNum, result.Err())
 	}
 
@@ -294,14 +302,14 @@ func (r *RedisStateReader) ReadAccountCode(address libcommon.Address, incarnatio
 	// Get the code using the code hash
 	ctx, cancel := context.WithTimeout(r.ctx, 5*time.Second)
 	defer cancel()
-	
+
 	key := codeKey(account.CodeHash)
 	result := r.client.Get(ctx, key)
 	if result.Err() == redis.Nil {
 		return nil, nil
 	}
 	if result.Err() != nil {
-		return nil, fmt.Errorf("failed to get code from redis for hash %s: %w", 
+		return nil, fmt.Errorf("failed to get code from redis for hash %s: %w",
 			account.CodeHash.Hex(), result.Err())
 	}
 
@@ -361,7 +369,7 @@ func (w *RedisStateWriter) UpdateAccountData(address libcommon.Address, original
 		Score:  float64(w.blockNum),
 		Member: string(data),
 	})
-	
+
 	if cmd.Err() != nil {
 		return fmt.Errorf("redis error updating account data for %s: %w", address.Hex(), cmd.Err())
 	}
@@ -375,32 +383,32 @@ func (w *RedisStateWriter) UpdateAccountCode(address libcommon.Address, incarnat
 	if len(code) == 0 {
 		return nil
 	}
-	
+
 	ctx, cancel := context.WithTimeout(w.ctx, 5*time.Second)
 	defer cancel()
-	
+
 	// Store code by hash (immutable)
 	key := codeKey(codeHash)
-	
+
 	// Check if code already exists - don't need to rewrite if it does
 	existsCmd := w.client.Exists(ctx, key)
 	if existsCmd.Err() != nil {
-		return fmt.Errorf("redis error checking code existence for hash %s: %w", 
+		return fmt.Errorf("redis error checking code existence for hash %s: %w",
 			codeHash.Hex(), existsCmd.Err())
 	}
-	
+
 	// If code already exists, skip writing it again
 	if existsCmd.Val() > 0 {
 		return nil
 	}
-	
+
 	// Store code with no expiration (immutable data)
 	setCmd := w.client.Set(ctx, key, code, 0)
 	if setCmd.Err() != nil {
-		return fmt.Errorf("redis error storing code for hash %s: %w", 
+		return fmt.Errorf("redis error storing code for hash %s: %w",
 			codeHash.Hex(), setCmd.Err())
 	}
-	
+
 	return nil
 }
 
@@ -408,7 +416,7 @@ func (w *RedisStateWriter) UpdateAccountCode(address libcommon.Address, incarnat
 func (w *RedisStateWriter) DeleteAccount(address libcommon.Address, original *accounts.Account) error {
 	ctx, cancel := context.WithTimeout(w.ctx, 5*time.Second)
 	defer cancel()
-	
+
 	// For deletion, we store an empty account with current block number
 	key := accountKey(address)
 	serialized := SerializedAccount{
@@ -428,7 +436,7 @@ func (w *RedisStateWriter) DeleteAccount(address libcommon.Address, original *ac
 		Score:  float64(w.blockNum),
 		Member: string(data),
 	})
-	
+
 	if cmd.Err() != nil {
 		return fmt.Errorf("redis error deleting account %s: %w", address.Hex(), cmd.Err())
 	}
@@ -440,7 +448,7 @@ func (w *RedisStateWriter) DeleteAccount(address libcommon.Address, original *ac
 func (w *RedisStateWriter) WriteAccountStorage(address libcommon.Address, incarnation uint64, key *libcommon.Hash, original, value *uint256.Int) error {
 	ctx, cancel := context.WithTimeout(w.ctx, 5*time.Second)
 	defer cancel()
-	
+
 	storageKeyStr := storageKey(address, key)
 
 	// Convert value to bytes
@@ -456,9 +464,9 @@ func (w *RedisStateWriter) WriteAccountStorage(address libcommon.Address, incarn
 		Score:  float64(w.blockNum),
 		Member: string(valueBytes),
 	})
-	
+
 	if cmd.Err() != nil {
-		return fmt.Errorf("redis error writing storage for %s at key %s: %w", 
+		return fmt.Errorf("redis error writing storage for %s at key %s: %w",
 			address.Hex(), key.Hex(), cmd.Err())
 	}
 
@@ -496,4 +504,3 @@ func (w *RedisStateWriter) CreateContract(address libcommon.Address) error {
 
 	return w.UpdateAccountData(address, nil, account)
 }
-

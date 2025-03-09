@@ -37,6 +37,10 @@ import (
 func applyTransaction(config *chain.Config, engine consensus.EngineReader, gp *GasPool, ibs *state.IntraBlockState,
 	stateWriter state.StateWriter, header *types.Header, txn types.Transaction, usedGas, usedBlobGas *uint64,
 	evm *vm.EVM, cfg vm.Config) (*types.Receipt, []byte, error) {
+	
+	// REDIS INTEGRATION: Wrap the stateWriter with our registered wrappers
+	stateWriter = state.WrapStateWriter(stateWriter, header.Number.Uint64())
+	
 	rules := evm.ChainRules()
 	blockNum := header.Number.Uint64()
 	msg, err := txn.AsMessage(*types.MakeSigner(config, blockNum, header.Time), header.BaseFee, rules)

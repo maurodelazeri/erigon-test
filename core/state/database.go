@@ -21,6 +21,8 @@
 package state
 
 import (
+	"fmt"
+
 	"github.com/holiman/uint256"
 
 	"github.com/erigontech/erigon-lib/common"
@@ -73,29 +75,60 @@ func NewNoopWriter() *NoopWriter {
 }
 
 func (nw *NoopWriter) UpdateAccountData(address common.Address, original, account *accounts.Account) error {
+	fmt.Println("MAURO UpdateAccountData")
 	return nil
 }
 
 func (nw *NoopWriter) DeleteAccount(address common.Address, original *accounts.Account) error {
+	fmt.Println("MAURO DeleteAccount")
+
 	return nil
 }
 
 func (nw *NoopWriter) UpdateAccountCode(address common.Address, incarnation uint64, codeHash common.Hash, code []byte) error {
+	fmt.Println("MAURO UpdateAccountCode")
+
 	return nil
 }
 
 func (nw *NoopWriter) WriteAccountStorage(address common.Address, incarnation uint64, key *common.Hash, original, value *uint256.Int) error {
+	fmt.Println("MAURO WriteAccountStorage")
+
 	return nil
 }
 
 func (nw *NoopWriter) CreateContract(address common.Address) error {
+	fmt.Println("MAURO CreateContract")
+
 	return nil
 }
 
 func (nw *NoopWriter) WriteChangeSets() error {
+	fmt.Println("MAURO WriteChangeSets")
 	return nil
 }
 
 func (nw *NoopWriter) WriteHistory() error {
+	fmt.Println("MAURO WriteHistory")
+
 	return nil
+}
+
+// StateWriterWrapper is a function type that wraps a StateWriter
+type StateWriterWrapper func(writer StateWriter, blockNum uint64) StateWriter
+
+// Global registry for StateWriter wrappers
+var stateWriterWrappers []StateWriterWrapper
+
+// RegisterStateWriterWrapper adds a StateWriter wrapper to the global registry
+func RegisterStateWriterWrapper(wrapper StateWriterWrapper) {
+	stateWriterWrappers = append(stateWriterWrappers, wrapper)
+}
+
+// WrapStateWriter applies all registered wrappers to a StateWriter
+func WrapStateWriter(writer StateWriter, blockNum uint64) StateWriter {
+	for _, wrapper := range stateWriterWrappers {
+		writer = wrapper(writer, blockNum)
+	}
+	return writer
 }

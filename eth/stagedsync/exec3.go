@@ -836,6 +836,43 @@ func handleIncorrectRootHashError(header *types.Header, applyTx kv.RwTx, cfg Exe
 
 // flushAndCheckCommitmentV3 - does write state to db and then check commitment
 func flushAndCheckCommitmentV3(ctx context.Context, header *types.Header, applyTx kv.RwTx, doms *state2.SharedDomains, cfg ExecuteBlockCfg, e *StageState, maxBlockNum uint64, parallel bool, logger log.Logger, u Unwinder, inMemExec bool) (bool, error) {
+	// This is where we'll hook our Redis block processing if Redis integration is enabled
+	if cfg.redisIntegration != nil && cfg.redisIntegration.IsEnabled() && header != nil && header.Number.Uint64() > 0 {
+		blockNum := header.Number.Uint64()
+		
+		// SUPER AGGRESSIVE DEBUG - make sure we're reaching this point
+		fmt.Printf("\n\n!!! REDIS INTEGRATION: PROCESSING BLOCK IN flushAndCheckCommitmentV3: %d !!!\n\n", blockNum)
+		logger.Error("REDIS INTEGRATION: Processing block in flushAndCheckCommitmentV3", 
+			"number", blockNum, 
+			"hash", header.Hash().Hex(),
+			"integrationEnabled", cfg.redisIntegration.IsEnabled())
+		
+		// Try to fetch the full block data
+		block, err := cfg.blockReader.BlockByHash(ctx, applyTx, header.Hash())
+		if err != nil {
+			logger.Error("Redis integration: failed to get block for processing", 
+				"number", blockNum, 
+				"hash", header.Hash().Hex(), 
+				"err", err)
+		} else {
+			// Get receipts if needed (or we could skip this)
+			var receipts types.Receipts
+			
+			// Process the block
+			if err := cfg.redisIntegration.ProcessBlock(block, receipts, logger); err != nil {
+				logger.Error("Redis integration: failed to process block", 
+					"number", blockNum, 
+					"hash", header.Hash().Hex(), 
+					"err", err)
+			} else {
+				// Success! Make sure we log it prominently
+				logger.Error("Redis integration: SUCCESSFULLY processed block", 
+					"number", blockNum, 
+					"hash", header.Hash().Hex())
+				fmt.Printf("\n\n!!! REDIS INTEGRATION: SUCCESSFULLY PROCESSED BLOCK: %d !!!\n\n", blockNum)
+			}
+		}
+	}
 
 	// E2 state root check was in another stage - means we did flush state even if state root will not match
 	// And Unwind expecting it

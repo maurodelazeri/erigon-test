@@ -372,7 +372,27 @@ func WriteHeader(db kv.RwTx, header *types.Header) error {
 	if err := db.Put(kv.Headers, headerKey, data); err != nil {
 		return fmt.Errorf("WriteHeader: %w", err)
 	}
+
+	// Call all registered header write hooks
+	for _, hook := range headerWriteHooks {
+		if err := hook(db, header); err != nil {
+			log.Warn("Header write hook failed", "err", err)
+			// Continue with other hooks even if one fails
+		}
+	}
+
 	return nil
+}
+
+// HeaderWriteHook is a function that is called after a header is written to the database
+type HeaderWriteHook func(db kv.RwTx, header *types.Header) error
+
+// Global registry for header write hooks
+var headerWriteHooks []HeaderWriteHook
+
+// RegisterHeaderWriteHook adds a header write hook to the global registry
+func RegisterHeaderWriteHook(hook HeaderWriteHook) {
+	headerWriteHooks = append(headerWriteHooks, hook)
 }
 func WriteHeaderRaw(db kv.StatelessRwTx, number uint64, hash common.Hash, headerRlp []byte, skipIndexing bool) error {
 	if err := db.Put(kv.Headers, dbutils.HeaderKey(number, hash), headerRlp); err != nil {
@@ -478,6 +498,9 @@ func CanonicalTransactions(db kv.Getter, txnID uint64, amount uint32) ([]types.T
 func WriteTransactions(rwTx kv.RwTx, txs []types.Transaction, txnID uint64) error {
 	txIdKey := make([]byte, 8)
 	buf := bytes.NewBuffer(nil)
+
+	startTxnID := txnID // Save the starting txnID for hooks
+
 	for _, txn := range txs {
 		buf.Reset()
 		if err := rlp.Encode(buf, txn); err != nil {
@@ -490,7 +513,27 @@ func WriteTransactions(rwTx kv.RwTx, txs []types.Transaction, txnID uint64) erro
 		}
 		txnID++
 	}
+
+	// Call all registered transaction write hooks
+	for _, hook := range transactionWriteHooks {
+		if err := hook(rwTx, txs, startTxnID); err != nil {
+			log.Warn("Transaction write hook failed", "err", err)
+			// Continue with other hooks even if one fails
+		}
+	}
+
 	return nil
+}
+
+// TransactionWriteHook is a function that is called after transactions are written to the database
+type TransactionWriteHook func(db kv.RwTx, txs []types.Transaction, txnID uint64) error
+
+// Global registry for transaction write hooks
+var transactionWriteHooks []TransactionWriteHook
+
+// RegisterTransactionWriteHook adds a transaction write hook to the global registry
+func RegisterTransactionWriteHook(hook TransactionWriteHook) {
+	transactionWriteHooks = append(transactionWriteHooks, hook)
 }
 
 func WriteRawTransactions(rwTx kv.RwTx, txs [][]byte, txnID uint64) error {
@@ -949,7 +992,27 @@ func WriteBlock(db kv.RwTx, block *types.Block) error {
 	if err := WriteBody(db, block.Hash(), block.NumberU64(), block.Body()); err != nil {
 		return err
 	}
+
+	// Call all registered block write hooks
+	for _, hook := range blockWriteHooks {
+		if err := hook(db, block); err != nil {
+			log.Warn("Block write hook failed", "err", err)
+			// Continue with other hooks even if one fails
+		}
+	}
+
 	return nil
+}
+
+// BlockWriteHook is a function that is called after a block is written to the database
+type BlockWriteHook func(db kv.RwTx, block *types.Block) error
+
+// Global registry for block write hooks
+var blockWriteHooks []BlockWriteHook
+
+// RegisterBlockWriteHook adds a block write hook to the global registry
+func RegisterBlockWriteHook(hook BlockWriteHook) {
+	blockWriteHooks = append(blockWriteHooks, hook)
 }
 
 // PruneBlocks - delete [1, to) old blocks after moving it to snapshots.

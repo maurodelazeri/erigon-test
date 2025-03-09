@@ -379,8 +379,132 @@ func New(ctx context.Context, stack *node.Node, config *ethconfig.Config, logger
 			
 			// Wrap accumulator to capture state changes for Redis
 			if backend.notifications != nil && backend.notifications.Accumulator != nil {
-				wrappedAcc := backend.redisIntegration.WrapAccumulator(backend.notifications.Accumulator, 0)
+				// Get the current block number to use as the starting point for Redis integration
+				var currentBlockNum uint64 = 0
+				if err := backend.chainDB.View(context.Background(), func(tx kv.Tx) error {
+					headHash := rawdb.ReadHeadBlockHash(tx)
+					if headHash != (libcommon.Hash{}) {
+						headerNumber := rawdb.ReadHeaderNumber(tx, headHash)
+						if headerNumber != nil {
+							header := rawdb.ReadHeader(tx, headHash, *headerNumber)
+							if header != nil {
+								currentBlockNum = header.Number.Uint64()
+							}
+						}
+					}
+					return nil
+				}); err != nil {
+					logger.Error("Failed to get current block number for Redis integration", "err", err)
+				}
+				
+				logger.Error("REDIS INTEGRATION: Wrapping accumulator to capture state changes", 
+					"currentBlockNum", currentBlockNum)
+				
+				// Wrap the accumulator - THIS IS THE CRITICAL PART!
+				wrappedAcc := backend.redisIntegration.WrapAccumulator(backend.notifications.Accumulator, currentBlockNum)
+				
+				// IMPORTANT: Make sure to use the wrapped accumulator!
 				backend.notifications.Accumulator = wrappedAcc
+				
+				// Log success to verify it happened
+				logger.Error("REDIS INTEGRATION: Successfully wrapped accumulator for Redis integration")
+				
+				// Add a polling hook to process blocks periodically
+				go func() {
+					pollInterval := 5 * time.Second
+					ticker := time.NewTicker(pollInterval)
+					defer ticker.Stop()
+					
+					var lastProcessedBlock uint64
+					
+					for {
+						select {
+						case <-ticker.C:
+							// Get current chain head
+							var currentHeader *types.Header
+							err := backend.chainDB.View(context.Background(), func(tx kv.Tx) error {
+								block, err := backend.blockReader.CurrentBlock(tx)
+								if err != nil {
+									return err
+								}
+								if block != nil {
+									currentHeader = block.Header()
+								}
+								return nil
+							})
+							
+							if err != nil {
+								logger.Error("REDIS INTEGRATION: Failed to get current block", "err", err)
+								continue
+							}
+							
+							if currentHeader != nil && currentHeader.Number.Uint64() > lastProcessedBlock {
+								blockNum := currentHeader.Number.Uint64()
+								
+								// Super aggressive logging
+								logger.Error("REDIS INTEGRATION: Processing new block via polling",
+									"number", blockNum,
+									"hash", currentHeader.Hash().Hex(),
+									"lastProcessed", lastProcessedBlock)
+									
+								fmt.Printf("\n\n!!! REDIS INTEGRATION: POLLING DETECTED NEW BLOCK: %d !!!\n\n", blockNum)
+								
+								// Get the full block
+								var block *types.Block
+								err := backend.chainDB.View(context.Background(), func(tx kv.Tx) error {
+									var err error
+									block, err = backend.blockReader.BlockByNumber(context.Background(), tx, blockNum)
+									return err
+								})
+								
+								if err != nil {
+									logger.Error("REDIS INTEGRATION: Failed to get block by number",
+										"number", blockNum,
+										"err", err)
+									continue
+								}
+								
+								// Process the block
+								if err := backend.redisIntegration.ProcessBlock(block, nil, logger); err != nil {
+									logger.Error("REDIS INTEGRATION: Failed to process block",
+										"number", blockNum,
+										"hash", block.Hash().Hex(),
+										"err", err)
+								} else {
+									logger.Error("REDIS INTEGRATION: Successfully processed block",
+										"number", blockNum,
+										"hash", block.Hash().Hex())
+										
+									// Update last processed
+									lastProcessedBlock = blockNum
+									
+									// Try to add some direct test writes to verify Redis connectivity
+									testKey := fmt.Sprintf("redis_polling_test_%d", blockNum)
+									testValue := fmt.Sprintf("Block %d processed by polling at %s", 
+										blockNum, time.Now().Format(time.RFC3339))
+										
+									// Use a direct Redis client call to test
+									redisCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+									err := backend.redisIntegration.GetClient().Set(redisCtx, testKey, testValue, 24*time.Hour).Err()
+									cancel()
+									
+									if err != nil {
+										logger.Error("REDIS INTEGRATION: Direct Redis test failed",
+											"key", testKey,
+											"err", err)
+									} else {
+										logger.Error("REDIS INTEGRATION: Direct Redis test succeeded",
+											"key", testKey)
+									}
+								}
+							}
+						case <-ctx.Done():
+							return
+						}
+					}
+				}()
+				
+				logger.Info("Redis integration: added polling hook to process blocks")
 			}
 			
 			// No additional block processing needed - state shadowing is sufficient

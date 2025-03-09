@@ -10,6 +10,7 @@ The Redis state implementation allows querying account state, storage, and contr
 
 - **O(1) Historical State Access**: Retrieve any account state or storage slot from any block in constant time
 - **Non-intrusive**: Works alongside Erigon without modifying its core database structure
+- **Full State Coverage**: Captures account balances, nonces, storage, and contract code
 - **High Performance**: Uses Redis sorted sets for efficient retrieval of historical state
 - **Standalone API Server**: Provides a dedicated API for state queries
 
@@ -22,15 +23,14 @@ Implements the state reader and writer interfaces backed by Redis:
 - `RedisStateReader`: Implements state reading from Redis
 - `RedisStateWriter`: Implements state writing to Redis
 - `RedisHistoricalWriter`: Extends the writer with history tracking capabilities
-- `RedisBlockWriter`: Handles writing block-related data like headers and receipts
 
-### 2. State Provider (`state_provider.go`)
+### 2. Block and Transaction Writer (`block_writer.go`)
 
-Implements the RPC interface for querying state:
+Manages block-related data storage in Redis:
 
-- Provides `StateAtBlock` and related methods for state access
-- Implements the Ethereum execution API via Redis
-- Includes compatibility with account abstraction
+- Stores block headers and transaction data
+- Tracks receipts and event logs
+- Handles chain reorganizations
 
 ### 3. Integration Layer (`integration.go`)
 
@@ -40,12 +40,49 @@ Provides utilities for integrating with a running Erigon node:
 - `BlockHeaderProcessor`: Processes block headers and stores them in Redis
 - Ensures state consistency between Erigon and Redis
 
-### 4. CLI Tool (`main.go`)
+### 4. Hook Management (`redis_hooks.go`)
+
+Manages the registration and usage of hooks to capture state changes:
+
+- Registers state writer wrappers
+- Sets up block write hooks
+- Handles transaction write hooks
+
+### 5. State Provider (`state_provider.go`)
+
+Implements the RPC interface for querying state:
+
+- Provides `StateAtBlock` and related methods for state access
+- Implements the Ethereum execution API via Redis
+- Includes compatibility with account abstraction
+
+### 6. CLI Tool (`cmd/redis-state/main.go`)
 
 Command-line interface for operating the Redis state system:
 
 - Runs a standalone API server for state queries
 - Configurable via command-line flags
+
+## State Flow in Erigon Integration
+
+The critical flow for capturing state changes:
+
+1. **State Writer Wrapping**: During transaction execution in `core/state_processor.go`, the state writer is wrapped:
+   ```go
+   stateWriter = state.WrapStateWriter(stateWriter, header.Number.Uint64())
+   ```
+
+2. **State Interception**: When state changes occur:
+   - Account changes go through `StateInterceptor.UpdateAccountData()`
+   - Storage changes go through `StateInterceptor.WriteAccountStorage()`
+   - Contract code changes go through `StateInterceptor.UpdateAccountCode()`
+
+3. **Storage Call Path**:
+   - `IntraBlockState.SetState()` is called by the EVM
+   - `stateObject.SetState()` records changes in `dirtyStorage`
+   - During `FinalizeTx()`, `stateObject.updateTrie()` is called
+   - `updateTrie()` calls `stateWriter.WriteAccountStorage()` for each dirty slot
+   - Our wrapper intercepts this and writes to both Erigon DB and Redis
 
 ## Getting Started
 
@@ -57,53 +94,68 @@ Command-line interface for operating the Redis state system:
 
 ### Configuration
 
-The Redis state service uses the following environment variables and flags:
+The Redis state integration is enabled with the following flags:
 
 ```
---datadir            Path to Erigon data directory
---chaindata          Path to Erigon chaindata directory (if different from <datadir>/chaindata)
---redis-url          Redis connection URL (default: "redis://localhost:6379/0")
---redis-password     Redis password
+--redis.enabled            Enable Redis state mirroring for O(1) historical state access
+--redis.url                Redis connection URL (default: "redis://localhost:6379/0")
+--redis.password           Redis password (optional)
+--redis.poolsize           Redis connection pool size (default: 10)
+--redis.maxretries         Redis maximum retries (default: 3)
+--redis.timeout            Redis connection timeout (default: 5s)
+--redis.loglevel           Redis state integration log level (default: "info")
+```
+
+Example:
+```bash
+./build/bin/erigon --redis.enabled --redis.url="redis://localhost:6379/0"
+```
+
+The standalone API server supports additional parameters:
+
+```
 --http.addr          HTTP-RPC server listening interface (default: "localhost")
 --http.port          HTTP-RPC server listening port (default: "8545")
 --http.api           API's offered over the HTTP-RPC interface (default: "eth,debug,net,web3")
 --http.corsdomain    Comma separated list of domains from which to accept cross origin requests
---http.vhosts        Comma separated list of virtual hostnames from which to accept requests
 --ws                 Enable the WS-RPC server
---ws.addr            WS-RPC server listening interface (default: "localhost")
---ws.port            WS-RPC server listening port (default: "8546")
---ws.api             API's offered over the WS-RPC interface (default: "eth,debug,net,web3")
---ws.origins         Origins from which to accept websockets requests
---log.level          Log level (trace, debug, info, warn, error, crit)
 ```
 
 ## Usage
 
-### 1. Start the State API Server
+### Running Erigon with Redis Integration
+
+To capture state in Redis while running Erigon:
+
+```bash
+./build/bin/erigon --redis.enabled --redis.url="redis://localhost:6379/0"
+```
+
+### Using the Standalone State API Server
 
 To run the standalone API server:
 
 ```bash
-redis-state --redis-url redis://localhost:6379/0 --http.addr 0.0.0.0 --http.port 8545 --http.api eth,debug,net,web3
+./build/bin/redis-state --redis-url="redis://localhost:6379/0" --http.addr="0.0.0.0" --http.port="8545"
 ```
 
-This starts an HTTP JSON-RPC server that provides Ethereum API endpoints backed by the Redis state.
+### Verifying Integration
 
-### 2. Use WebSocket for Subscriptions (Optional)
-
-To enable WebSocket support:
+You can verify the integration is working using Redis CLI:
 
 ```bash
-redis-state --redis-url redis://localhost:6379/0 --ws --ws.addr 0.0.0.0 --ws.port 8546 --ws.api eth,debug,net,web3
+# List all Redis keys
+redis-cli KEYS *
+
+# Check for account states
+redis-cli KEYS "account:*"
+
+# Check for storage values
+redis-cli KEYS "storage:*"
+
+# Check for a specific contract's storage
+redis-cli KEYS "storage:0x1234567890abcdef:*"
 ```
-
-### 3. Integrating with a Running Erigon Node
-
-To continuously mirror state changes from a running Erigon node to Redis, you need to:
-
-1. Create the proper interceptors in your Erigon node
-2. Use the provided integration utilities
-3. See `INTEGRATION.md` for detailed instructions
 
 ## Data Model
 
@@ -126,9 +178,29 @@ The Redis state implementation uses the following key patterns:
 - Consider using Redis persistence options like RDB or AOF for data durability
 - For large-scale deployments, consider Redis Cluster for horizontal scaling
 
-## Diagrams
+## Debugging and Troubleshooting
 
-### Architecture
+If you're not seeing account state or storage data in Redis:
+
+1. **Verify Redis integration is enabled**:
+   - Make sure you're running with `--redis.enabled`
+   - Check for logs indicating "Redis state integration initialized successfully"
+
+2. **Add debug logging in key places**:
+   - In `stateObject.updateTrie()` to verify storage is being written
+   - In `RedisStateWriter.WriteAccountStorage()` to verify Redis operations
+
+3. **Test with active contracts**:
+   - Deploy a simple storage contract
+   - Make transactions that modify its state
+   - Check Redis for the storage changes
+
+4. **Common Redis Issues**:
+   - Connection refused: Ensure Redis server is running and accessible
+   - Memory issues: Monitor Redis memory usage
+   - Connection limits: Adjust poolsize parameter for high-load systems
+
+## Architecture
 
 ```
 ┌────────────────┐      ┌───────────────┐      ┌────────────────┐
@@ -155,98 +227,15 @@ The Redis state implementation uses the following key patterns:
                         └────────────────┘
 ```
 
-### Data Flow
+## Future Improvements
 
-```
-1. State Changes in Erigon
-   │
-   ▼
-2. StateInterceptor captures changes
-   │
-   ▼
-3. RedisStateWriter writes to Redis
-   │
-   ▼
-4. Redis stores data in sorted sets
-   │
-   ▼
-5. RedisStateReader reads historical state
-   │
-   ▼
-6. State API Server exposes data via JSON-RPC
-```
+Planned enhancements for the Redis state integration:
 
-## Function Call Flow for State Retrieval
-
-```
-Client Request
-   │
-   ▼
-StateAtBlock(blockNumber)
-   │
-   ▼
-PointInTimeRedisStateReader
-   │
-   ▼
-ZRevRangeByScore(key, 0, blockNumber)
-   │
-   ▼
-Process and return result
-```
-
-## Continuous Operation
-
-For continuous operation where the Redis state tracks new blocks as they arrive:
-
-1. Set up the Erigon node with the integration module
-2. The StateInterceptor will automatically mirror all state changes to Redis
-3. Run the Redis State API server to expose the data
-
-## Troubleshooting
-
-### Common Issues
-
-- **Connection refused**: Ensure Redis server is running and accessible
-- **Memory usage**: Monitor Redis memory usage and consider tuning maxmemory settings
-- **Performance degradation**: Check Redis persistence settings, consider disabling AOF for better performance
-
-### Monitoring
-
-The Redis state system logs useful information for monitoring:
-
-- Error conditions during operation
-- Performance metrics
-
-Use standard Redis monitoring tools like `redis-cli info` to track memory usage and operation counts.
-
-## Recent Improvements
-
-The Redis state implementation has been recently enhanced with the following improvements:
-
-### Performance Optimizations
-
-- Added context timeouts to all Redis operations to prevent hanging
-- Implemented Redis pipelines for batching operations and reducing network roundtrips
-- Added optimization for code storage to avoid redundant writes for immutable data
-- Improved indexing of logs for more efficient filtering by address and topics
-
-### Reliability Enhancements
-
-- Added comprehensive error handling with proper error propagation
-- Improved error logging with context-specific messages
-- Implemented fallback mechanism to continue operation despite Redis failures
-- Added optional expiration for certain indices to manage memory usage
-
-### Data Model Improvements
-
-- Enhanced the block transactions indexing for faster retrieval
-- Added block summary data for quick access to critical block information
-- Improved logging organization with block+address+topic composite keys
-- Implemented more efficient transaction storage pattern
-
-## Contributing
-
-Contributions to the Redis state implementation are welcome! Please follow the Erigon project's contribution guidelines.
+1. **Pruning Options**: Configure retention policies for historical state
+2. **Optimized Storage**: Compression and deduplication of repeated values
+3. **Sharding**: Support for Redis Cluster with strategic key distribution
+4. **Streaming Updates**: WebSocket-based state change notifications
+5. **Plugin System**: Extensible hooks for custom data processing
 
 ## License
 
