@@ -8,6 +8,7 @@ import (
 
 	chaos_monkey "github.com/erigontech/erigon/tests/chaos-monkey"
 
+	libcommon "github.com/erigontech/erigon-lib/common"
 	"github.com/erigontech/erigon-lib/log/v3"
 	state2 "github.com/erigontech/erigon-lib/state"
 	"github.com/erigontech/erigon/consensus"
@@ -38,6 +39,22 @@ func (se *serialExecutor) execute(ctx context.Context, tasks []*state.TxTask) (c
 	for _, txTask := range tasks {
 		if txTask.Error != nil {
 			return false, nil
+		}
+
+		// Initialize Redis state for this block if Redis is enabled
+		// This is a critical fix to ensure block context is set in Redis
+		if state.IsRedisEnabled() && txTask.BlockNum > 0 {
+			blockNum := txTask.BlockNum
+			redisWriter := state.GetRedisStateWriter(blockNum)
+			if redisWriter != nil {
+				if redisHistoryWriter, ok := redisWriter.(state.RedisHistoricalWriter); ok {
+					if err := redisHistoryWriter.WriteBlockStart(blockNum); err != nil {
+						se.logger.Warn("Failed to initialize Redis block", "block", blockNum, "err", err)
+					} else {
+						se.logger.Debug("Successfully initialized Redis block", "block", blockNum)
+					}
+				}
+			}
 		}
 
 		se.applyWorker.RunTxTaskNoLock(txTask, se.isMining)
@@ -134,6 +151,33 @@ func (se *serialExecutor) execute(ctx context.Context, tasks []*state.TxTask) (c
 }
 
 func (se *serialExecutor) commit(ctx context.Context, txNum uint64, blockNum uint64, useExternalTx bool) (t2 time.Duration, err error) {
+	// Finalize Redis writes for this block if Redis is enabled
+	if state.IsRedisEnabled() && blockNum > 0 {
+		se.logger.Debug("Finalizing Redis block data", "block", blockNum)
+		if redisWriter := state.GetRedisStateWriter(blockNum); redisWriter != nil {
+			if redisHistoryWriter, ok := redisWriter.(state.RedisHistoricalWriter); ok {
+				// Store block header and state root with proper method
+				if header := se.getHeader(ctx, libcommon.Hash{}, blockNum); header != nil {
+					if err := redisHistoryWriter.StoreBlockInfo(header, header.Root); err != nil {
+						se.logger.Warn("Failed to store block info in Redis", "block", blockNum, "err", err)
+					} else {
+						se.logger.Debug("Successfully stored block info in Redis", "block", blockNum)
+					}
+				}
+
+				// Write change sets
+				if err := redisHistoryWriter.WriteChangeSets(); err != nil {
+					se.logger.Warn("Failed to write change sets to Redis", "block", blockNum, "err", err)
+				}
+
+				// Write history
+				if err := redisHistoryWriter.WriteHistory(); err != nil {
+					se.logger.Warn("Failed to write history to Redis", "block", blockNum, "err", err)
+				}
+			}
+		}
+	}
+
 	se.doms.Close()
 	if err = se.execStage.Update(se.applyTx, blockNum); err != nil {
 		return 0, err

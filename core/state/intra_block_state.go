@@ -919,6 +919,9 @@ func (sdb *IntraBlockState) SoftFinalise() {
 // CommitBlock finalizes the state by removing the self destructed objects
 // and clears the journal as well as the refunds.
 func (sdb *IntraBlockState) CommitBlock(chainRules *chain.Rules, stateWriter StateWriter) error {
+	logger := log.Root()
+	
+	// First, ensure all balance increases are processed
 	for addr, bi := range sdb.balanceInc {
 		if !bi.transferred {
 			sdb.getStateObject(addr)
@@ -932,14 +935,42 @@ func (sdb *IntraBlockState) CommitBlock(chainRules *chain.Rules, stateWriter Sta
 	}
 	
 	// If Redis is enabled, make sure we also write the state to Redis
-	if IsRedisEnabled() && sdb.currentBlock > 0 {
-		if redisWriter := GetRedisStateWriter(sdb.currentBlock); redisWriter != nil {
-			// Commit state to Redis separately
-			if err := sdb.MakeWriteSet(chainRules, redisWriter); err != nil {
-				// Log the error but don't fail the block
-				logger := log.Root()
-				logger.Warn("Failed to commit block state to Redis", "err", err, "block", sdb.currentBlock)
+	if IsRedisEnabled() {
+		// Debug log to help diagnose issues
+		logger.Debug("Redis state commit check", 
+			"enabled", IsRedisEnabled(), 
+			"currentBlock", sdb.currentBlock, 
+			"condition", sdb.currentBlock > 0)
+		
+		// Only proceed if we have a valid block number
+		if sdb.currentBlock > 0 {
+			logger.Debug("Committing state to Redis for block", "block", sdb.currentBlock)
+			redisWriter := GetRedisStateWriter(sdb.currentBlock)
+			
+			if redisWriter != nil {
+				// Commit state to Redis separately
+				if err := sdb.MakeWriteSet(chainRules, redisWriter); err != nil {
+					// Log the error but don't fail the block
+					logger.Warn("Failed to commit block state to Redis", "err", err, "block", sdb.currentBlock)
+				} else {
+					logger.Debug("Successfully committed state to Redis", "block", sdb.currentBlock)
+					
+					// Also finalize the block in Redis if possible
+					if historyWriter, ok := redisWriter.(RedisHistoricalWriter); ok {
+						if err := historyWriter.WriteChangeSets(); err != nil {
+							logger.Warn("Failed to write change sets to Redis", "err", err, "block", sdb.currentBlock)
+						}
+						
+						if err := historyWriter.WriteHistory(); err != nil {
+							logger.Warn("Failed to write history to Redis", "err", err, "block", sdb.currentBlock)
+						}
+					}
+				}
+			} else {
+				logger.Warn("Failed to get Redis writer for block", "block", sdb.currentBlock)
 			}
+		} else {
+			logger.Debug("Skipping Redis state commit for block 0")
 		}
 	}
 	
@@ -998,24 +1029,43 @@ func (sdb *IntraBlockState) SetTxContext(ti int) {
 // SetBlockContext sets the current block number being processed
 // This is used for Redis state integration
 func (sdb *IntraBlockState) SetBlockContext(blockNum uint64) {
+	// Set the current block number in the state database
 	sdb.currentBlock = blockNum
 	
 	// Initialize Redis state for this block if Redis is enabled
 	if IsRedisEnabled() {
+		logger := log.Root()
+		logger.Debug("Initializing Redis state for block", "block", blockNum)
+		
 		// Create a new writer if needed
 		redisWriter := GetRedisStateWriter(blockNum)
 		
 		// Initialize block in Redis
 		if redisWriter != nil {
-			if redisHistoryWriter, ok := redisWriter.(interface {
-				WriteBlockStart(blockNum uint64) error
-			}); ok {
+			// Try to cast to RedisHistoricalWriter to access WriteBlockStart
+			if redisHistoryWriter, ok := redisWriter.(RedisHistoricalWriter); ok {
 				if err := redisHistoryWriter.WriteBlockStart(blockNum); err != nil {
 					// Log the error but don't fail
-					logger := log.Root()
 					logger.Warn("Failed to initialize block in Redis", "block", blockNum, "err", err)
+				} else {
+					logger.Debug("Successfully initialized Redis block", "block", blockNum)
+				}
+			} else {
+				// Also try with interface{} method for backward compatibility
+				if altWriter, ok := redisWriter.(interface {
+					WriteBlockStart(blockNum uint64) error
+				}); ok {
+					if err := altWriter.WriteBlockStart(blockNum); err != nil {
+						logger.Warn("Failed to initialize block in Redis (alt method)", "block", blockNum, "err", err)
+					} else {
+						logger.Debug("Successfully initialized Redis block (alt method)", "block", blockNum)
+					}
+				} else {
+					logger.Warn("Redis writer doesn't implement WriteBlockStart", "block", blockNum)
 				}
 			}
+		} else {
+			logger.Warn("Failed to get Redis writer for block", "block", blockNum)
 		}
 	}
 }

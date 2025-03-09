@@ -17,6 +17,7 @@
 package redisstate
 
 import (
+	"github.com/erigontech/erigon-lib/log/v3"
 	"github.com/erigontech/erigon/core/state"
 )
 
@@ -25,6 +26,11 @@ func init() {
 	// Register the Redis writer factory with the state package
 	// This allows the state package to create Redis writers when needed
 	// without introducing circular dependencies
+	logger := log.Root()
+	logger.Info("Registering Redis writer factory with core/state package")
+	
 	factoryFn := GetRedisWriterFactoryFn()
 	state.SetRedisWriterFactory(factoryFn)
+	
+	logger.Info("Redis writer factory registered successfully")
 }

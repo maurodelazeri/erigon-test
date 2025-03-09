@@ -509,6 +509,14 @@ func (w *RedisStateWriter) UpdateAccountData(address libcommon.Address, original
 		return errors.New("account cannot be nil")
 	}
 
+	// Add detailed debug logging
+	w.logger.Debug("Redis: Updating account data", 
+		"block", w.blockNum, 
+		"address", address.Hex(), 
+		"nonce", account.Nonce,
+		"balance", account.Balance.Hex(),
+		"codeHash", account.CodeHash.Hex())
+
 	ctx, cancel := context.WithTimeout(w.ctx, 5*time.Second)
 	defer cancel()
 
@@ -532,9 +540,16 @@ func (w *RedisStateWriter) UpdateAccountData(address libcommon.Address, original
 	})
 
 	if cmd.Err() != nil {
+		w.logger.Error("Redis: Failed to update account data", 
+			"address", address.Hex(), 
+			"block", w.blockNum, 
+			"err", cmd.Err())
 		return fmt.Errorf("redis error updating account data for %s: %w", address.Hex(), cmd.Err())
 	}
 
+	w.logger.Debug("Redis: Successfully updated account data", 
+		"address", address.Hex(), 
+		"block", w.blockNum)
 	return nil
 }
 

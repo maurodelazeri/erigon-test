@@ -92,6 +92,7 @@ import (
 	"github.com/erigontech/erigon/core/rawdb"
 	"github.com/erigontech/erigon/core/rawdb/blockio"
 	snaptype2 "github.com/erigontech/erigon/core/snaptype"
+	"github.com/erigontech/erigon/core/state"
 	"github.com/erigontech/erigon/core/types"
 	"github.com/erigontech/erigon/core/vm"
 	"github.com/erigontech/erigon/eth/consensuschain"
@@ -361,7 +362,23 @@ func New(ctx context.Context, stack *node.Node, config *ethconfig.Config, logger
 			logger.Warn("Failed to initialize Redis client", "err", err)
 			// We don't return error as Redis is optional and shouldn't prevent Erigon from starting
 		} else {
-			logger.Info("Redis state integration initialized successfully")
+			// Create and register the Redis writer factory with the state package
+			// This is the critical connection point that makes the Redis integration work
+			writerFactoryFn := redisstate.GetRedisWriterFactoryFn()
+			state.SetRedisWriterFactory(writerFactoryFn)
+
+			// Verify Redis connection and initialization
+			diagnostics := redisstate.DiagnoseRedisConnection()
+			if diagnostics["status"] == "connected" {
+				logger.Info("Redis state integration initialized and verified",
+					"address", diagnostics["address"],
+					"connected", diagnostics["status"] == "connected",
+					"write_success", diagnostics["write_success"])
+			} else {
+				logger.Error("Redis connection verified but may have issues",
+					"status", diagnostics["status"],
+					"error", diagnostics["error"])
+			}
 		}
 	}
 

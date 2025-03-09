@@ -1,200 +1,386 @@
-# Redis State Integration for Erigon
+# Redis State Integration for Erigon - Complete Implementation Guide
 
-This module implements integration between Erigon and Redis for state persistence. It allows Erigon to write blockchain state to Redis in parallel with its normal database writes, providing O(1) access to any historical state.
+This document provides a comprehensive guide to the Redis state integration in Erigon. It details what data is stored, how it's structured, where the integration points are, and how to implement and verify the integration.
 
 ## Overview
 
-The Redis state integration enables several use cases:
-- Maintaining a secondary copy of the blockchain state for redundancy
-- Exposing blockchain state through a Redis interface for external applications
-- Supporting custom analytical applications with live state updates
-- Allowing blockchain explorers to access state without direct Erigon API access
+The Redis state integration allows Erigon to write all blockchain data to Redis in parallel with its normal database operations. This provides:
 
-## How O(1) Access Works with Redis
+1. **O(1) Access to Historical State**: Access any account state at any block height with constant time complexity
+2. **Complete Blockchain Data**: Store accounts, storage, code, transactions, receipts, logs, and blocks
+3. **Real-time Updates**: Data is written to Redis as blocks are processed
+4. **Chain Reorganization Handling**: Proper tracking of canonical chain during reorgs
 
-The key innovation is using Redis sorted sets to store state changes with block numbers as scores. This approach enables:
+## Data Storage Model
 
-1. **Constant-Time Lookups**: Finding the state at any block takes the same amount of time, whether it's yesterday's block or from years ago
-2. **No Chain Traversal**: Traditional systems need to replay or traverse the chain; ours doesn't
-3. **Efficient Storage**: We only store states when they change, not for every block
+All blockchain data is stored in Redis using these key patterns:
 
-## Configuration
+### Account Data
 
-To enable Redis state persistence, use the following command line flags:
+- `account:{address}` → Sorted set with block numbers as scores
+  - Example: `account:0x742d35Cc6634C0532925a3b844Bc454e4438f44e`
+  - Contains: JSON with `nonce`, `balance`, `codeHash`, `incarnation`
 
-```
---redis.enabled             Enable Redis state persistence (default: false)
---redis.url                 Redis connection URL (default: "redis://localhost:6379/0")
---redis.password            Redis password (default: "")
-```
+### Contract Code
 
-## Architecture
+- `code:{codeHash}` → Raw bytecode
+  - Example: `code:0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef`
+  - Contains: Raw contract bytecode (immutable)
 
-The Redis state integration uses a factory pattern to avoid circular dependencies between packages. The main components are:
+### Storage Slots
 
-1. **RedisStateReader**: Reads state from Redis at the latest block or a specific historical block
-2. **RedisStateWriter**: Writes state changes to Redis
-3. **RedisHistoricalWriter**: Extends RedisStateWriter with history awareness
-4. **RedisStateProvider**: Implements provider interfaces for Erigon's RPC API
-
-## Data Model
-
-State data is stored in Redis using the following key patterns:
-
-### Account and State Data
-- `account:{address}` - Account data (sorted set with block numbers as scores)
-- `storage:{address}:{key}` - Storage data (sorted set with block numbers as scores)
-- `code:{codehash}` - Contract code
+- `storage:{address}:{key}` → Sorted set with block numbers as scores
+  - Example: `storage:0x742d35Cc6634C0532925a3b844Bc454e4438f44e:0x0000000000000000000000000000000000000000000000000000000000000001`
+  - Contains: Raw storage slot values
 
 ### Block Data
-- `block:{number}` - Block data
-- `blockHash:{hash}` - Mapping from block hash to block number
-- `canonicalChain` - Sorted set of canonical block hashes with block numbers as scores
-- `currentBlock` - Latest block number
-- `reorg:{blockNum}` - Marker for blocks that were part of a chain reorganization
 
-### Transaction and Receipt Data
-- `tx:{hash}` - Transaction data (sorted set with block numbers as scores)
-- `block:{number}:txs` - Set of transaction hashes in a block
-- `sender:{address}:txs` - Transactions sent by an address (sorted set with block numbers as scores)
-- `receipt:{hash}` - Receipt data (sorted set with block numbers as scores)
-- `block:{number}:receipts` - Ordered list of receipts in a block (sorted set with tx indices as scores)
+- `block:{number}` → Hash map with block details
+  - Example: `block:15000000`
+  - Contains: Header, timestamp, state root, hash, parent hash
+- `blockHash:{hash}` → Hash map mapping hash to block number
+  - Example: `blockHash:0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef`
+  - Contains: Block number, timestamp, canonical status
+- `canonicalChain` → Sorted set of block hashes with block numbers as scores
+  - Contains: All canonical block hashes in order
+
+### Transaction Data
+
+- `tx:{hash}` → Sorted set with block numbers as scores
+  - Example: `tx:0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef`
+  - Contains: Serialized transaction data
+- `block:{number}:txs` → Set of transaction hashes in this block
+  - Example: `block:15000000:txs`
+- `sender:{address}:txs` → Sorted set of transaction hashes sent by address
+  - Example: `sender:0x742d35Cc6634C0532925a3b844Bc454e4438f44e:txs`
+
+### Receipt Data
+
+- `receipt:{hash}` → Sorted set with block numbers as scores
+  - Example: `receipt:0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef`
+  - Contains: Serialized receipt data (status, logs, gas used)
+- `block:{number}:receipts` → Sorted set of receipts in block order
+  - Example: `block:15000000:receipts`
 
 ### Event Logs
-- `log:{index}` - Log data
-- `topic:{hash}` - Logs by topic (sorted set with block numbers as scores)
-- `address:{address}:logs` - Logs by emitting address (sorted set with block numbers as scores)
 
-## Chain Reorganization Handling
+- `log:{index}` → Raw log data
+  - Example: `log:1234567`
+  - Contains: JSON with address, topics, data, block, tx info
+- `topic:{hash}` → Sorted set of log indices with block numbers as scores
+  - Example: `topic:0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef`
+- `address:{address}:logs` → Sorted set of log indices with block numbers as scores
+  - Example: `address:0x742d35Cc6634C0532925a3b844Bc454e4438f44e:logs`
 
-The Redis state integration handles chain reorganizations (reorgs) by:
+### Chain Management
 
-1. Detecting when blocks are unwound during a reorg
-2. Marking reorged blocks with special markers
-3. Tracking the canonical chain to distinguish between canonical and non-canonical blocks
-4. Providing accurate historical state access even after reorgs
+- `currentBlock` → Latest block number processed
+- `reorg:{blockNum}` → Markers for blocks that were reorged out
 
-## Practical Example
+## Implementation Architecture
 
-Let's walk through a concrete example of how this works:
+The Redis integration is structured with these key components:
 
-### Scenario: Querying an Account Balance at Block 2000
+1. **RedisStateReader**: Reads state from Redis at specific block heights
+2. **RedisStateWriter**: Writes account and storage state to Redis
+3. **RedisHistoricalWriter**: Adds block and history tracking capabilities
+4. **Factory Pattern**: Creates appropriate writers per block
 
-Imagine an account that has changed its balance only at blocks 20, 450, and 3000:
+## Integration Points
 
-```
-Block 20:   Balance set to 5 ETH
-Block 450:  Balance changed to 7.5 ETH
-Block 3000: Balance changed to 10 ETH
-```
+The Redis integration hooks into Erigon's execution flow at these critical points:
 
-When querying for the balance at block 2000, our Redis State system:
+### 1. Initialization
 
-1. Uses `ZREVRANGEBYSCORE` to get the most recent state change ≤ block 2000
-2. Immediately retrieves the value from block 450 (7.5 ETH) in a single operation
-3. Performance remains constant regardless of chain size (O(1) complexity)
-
-## Usage Examples
-
-### Accessing Account State
+**File**: `eth/backend.go`
 
 ```go
-package main
+// Initialize Redis if enabled
+if stack.Config().Redis.Enabled {
+    logger.Info("Initializing Redis state integration", "url", stack.Config().Redis.URL)
+    if err := redisstate.InitializeRedisClient(context.Background(), stack.Config().Redis.URL, stack.Config().Redis.Password, logger); err != nil {
+        logger.Warn("Failed to initialize Redis client", "err", err)
+    } else {
+        // Register the Redis writer factory with core state
+        writerFactoryFn := redisstate.GetRedisWriterFactoryFn()
+        state.SetRedisWriterFactory(writerFactoryFn)
 
-import (
-    "context"
-    "fmt"
-    "log"
+        // Verify Redis connection
+        diagnostics := redisstate.DiagnoseRedisConnection()
+        logger.Info("Redis integration initialized", "status", diagnostics["status"])
+    }
+}
+```
 
-    "github.com/erigontech/erigon-lib/common"
-    "github.com/erigontech/erigon/redis-state"
-    "github.com/redis/go-redis/v9"
-)
+### 2. Block Context Setup
 
-func main() {
-    // Connect to Redis
-    client := redis.NewClient(&redis.Options{
-        Addr: "localhost:6379",
-    })
+**File**: `cmd/state/exec3/state.go`
 
-    // Create a state provider
-    provider := redisstate.NewRedisStateProvider(client, log.Default())
-
-    // Get balance of an account
-    address := common.HexToAddress("0x742d35Cc6634C0532925a3b844Bc454e4438f44e")
-    balance, err := provider.BalanceAt(context.Background(), address, -1) // Latest block
-    if err != nil {
-        log.Fatalf("Error getting balance: %v", err)
+```go
+func (rw *Worker) RunTxTaskNoLock(txTask *state.TxTask, isMining bool) {
+    // Set the block context for Redis integration
+    if state.IsRedisEnabled() && txTask.BlockNum > 0 {
+        rw.ibs.SetBlockContext(txTask.BlockNum)
     }
 
-    fmt.Printf("Balance: %s\n", balance.String())
+    // Rest of transaction processing...
 }
 ```
 
-### Accessing Transactions and Receipts
+### 3. Block Initialization
+
+**File**: `eth/stagedsync/exec3_serial.go`
 
 ```go
-// Get transaction by hash
-tx, blockHash, blockNum, txIndex, err := provider.GetTransactionByHash(ctx, txHash)
-if err != nil {
-    log.Fatalf("Error getting transaction: %v", err)
-}
+func (se *serialExecutor) execute(ctx context.Context, tasks []*state.TxTask) (cont bool, err error) {
+    for _, txTask := range tasks {
+        // Initialize Redis state for this block if Redis is enabled
+        if state.IsRedisEnabled() && txTask.BlockNum > 0 {
+            blockNum := txTask.BlockNum
+            redisWriter := state.GetRedisStateWriter(blockNum)
+            if redisWriter != nil {
+                if redisHistoryWriter, ok := redisWriter.(state.RedisHistoricalWriter); ok {
+                    redisHistoryWriter.WriteBlockStart(blockNum)
+                }
+            }
+        }
 
-// Get receipt for a transaction
-receipt, err := provider.GetTransactionReceipt(ctx, txHash)
-if err != nil {
-    log.Fatalf("Error getting receipt: %v", err)
+        // Execute transaction...
+    }
 }
-
-// Get logs by filter
-filter := &types.LogFilter{
-    FromBlock: rpc.BlockNumber(10000000),
-    ToBlock:   rpc.BlockNumber(10001000),
-    Addresses: []common.Address{contractAddress},
-    Topics:    [][]common.Hash{{eventSignature}},
-}
-logs, err := provider.GetLogs(ctx, filter)
 ```
 
-## Complete Functionality
+### 4. State Changes
 
-The Redis system stores more than just account and storage state:
+**File**: `core/state/intra_block_state.go`
 
-1. **Block Headers**: Complete block metadata is stored
-2. **Transaction Data**: All transaction details are mirrored to Redis
-3. **Event Logs**: Log entries emitted by contracts are captured
-4. **Chain Structure**: Block relationships are tracked to handle reorganizations
+```go
+// CommitBlock finalizes the state
+func (sdb *IntraBlockState) CommitBlock(chainRules *chain.Rules, stateWriter StateWriter) error {
+    // Regular state commit
+    err := sdb.MakeWriteSet(chainRules, stateWriter)
 
-## Implementation Details
+    // Redis state commit
+    if IsRedisEnabled() && sdb.currentBlock > 0 {
+        if redisWriter := GetRedisStateWriter(sdb.currentBlock); redisWriter != nil {
+            sdb.MakeWriteSet(chainRules, redisWriter)
+        }
+    }
 
-For efficiency, we only store state changes when values actually change:
+    return nil
+}
+```
 
-- If an account balance doesn't change for 10,000 blocks, we only store one entry
-- If a storage slot is modified frequently, we store each unique change
+### 5. Transaction Processing
 
-For more detailed implementation information, please see [IMPLEMENTATION.md](IMPLEMENTATION.md)
+**File**: `core/state_processor.go`
 
-## Limitations
+```go
+func applyTransaction(config *chain.Config, engine consensus.EngineReader, gp *GasPool, ibs *state.IntraBlockState,
+    stateWriter state.StateWriter, header *types.Header, txn types.Transaction, usedGas, usedBlobGas *uint64,
+    evm *vm.EVM, cfg vm.Config) (*types.Receipt, []byte, error) {
 
-- Redis storage can grow large for mainnet deployments - consider using Redis with persistence disabled for ephemeral use cases
-- Performance under heavy load depends on Redis server capacity
-- For production deployments, consider using Redis Cluster for scalability
+    // Transaction execution...
 
-## Recent Improvements
+    // Add Redis transaction and receipt handling
+    if state.IsRedisEnabled() && receipt != nil {
+        if redisWriter := state.GetRedisStateWriter(header.Number.Uint64()); redisWriter != nil {
+            redisWriter.SetTxNum(uint64(receipt.TransactionIndex))
 
-- **Enhanced Integration**: Full integration with Erigon's block, transaction and state processing
-- **Self-destruct Handling**: Properly track account deletion during state transitions
-- **Block Finalization**: Complete block metadata is now stored with state root and header hash
-- **Chain Reorg Awareness**: Improved tracking of canonical chain during reorganizations
-- **Cache Management**: Added writer caching for better performance during block processing
-- **Factory Pattern**: Improved factory implementation to avoid circular dependencies
+            if redisHistoryWriter, ok := redisWriter.(state.RedisHistoricalWriter); ok {
+                redisHistoryWriter.HandleTransaction(txn, receipt, header.Number.Uint64(), uint64(receipt.TransactionIndex))
+            }
+        }
+    }
 
-## Future Improvements
+    return receipt, result.ReturnData, err
+}
+```
 
-- Implement pruning strategies for old state data
-- Add support for sharded Redis deployments 
-- Optimize storage format for reduced memory usage
-- Add streaming capabilities for real-time state updates
-- Add support for Redis Cluster and Redis Sentinel for high availability
-- Implement batch operations for improved write performance
-- Add metrics and observability for Redis operations
+### 6. Block Finalization
+
+**File**: `eth/stagedsync/exec3_serial.go`
+
+```go
+func (se *serialExecutor) commit(ctx context.Context, txNum uint64, blockNum uint64, useExternalTx bool) (t2 time.Duration, err error) {
+    // Finalize Redis writes for this block
+    if state.IsRedisEnabled() && blockNum > 0 {
+        if redisWriter := state.GetRedisStateWriter(blockNum); redisWriter != nil {
+            if redisHistoryWriter, ok := redisWriter.(state.RedisHistoricalWriter); ok {
+                // Store block header and state root
+                if header := se.getHeader(ctx, libcommon.Hash{}, blockNum); header != nil {
+                    redisHistoryWriter.StoreBlockInfo(header, header.Root)
+                }
+
+                // Finalize block in Redis
+                redisHistoryWriter.WriteChangeSets()
+                redisHistoryWriter.WriteHistory()
+            }
+        }
+    }
+
+    // Regular commit operations...
+}
+```
+
+### 7. Chain Reorganization
+
+**File**: `eth/stagedsync/stage_execute.go`
+
+```go
+func unwindExec3(u *UnwindState, s *StageState, txc wrap.TxContainer, ctx context.Context, br services.FullBlockReader, accumulator *shards.Accumulator, logger log.Logger) (err error) {
+    // Track blocks to unwind in Redis
+    if state.IsRedisEnabled() {
+        blocksToUnwind := make([]uint64, 0, u.CurrentBlockNumber-u.UnwindPoint)
+
+        // Track blocks being unwound
+        for currentBlock := u.CurrentBlockNumber; currentBlock > u.UnwindPoint; currentBlock-- {
+            blocksToUnwind = append(blocksToUnwind, currentBlock)
+        }
+
+        // Handle Redis unwind
+        if err := redisstate.HandleChainReorg(u.CurrentBlockNumber, u.UnwindPoint, logger); err != nil {
+            logger.Warn("Failed to handle Redis chain reorg", "err", err)
+        }
+    }
+
+    // Regular unwind operations...
+}
+```
+
+## Implementation Methods
+
+The core Redis functionality is implemented in these files:
+
+### redis_state.go
+
+Contains the implementation of Redis state readers and writers:
+
+1. **Account State Methods**:
+
+   - `ReadAccountData` - Reads account state
+   - `UpdateAccountData` - Writes account state
+   - `DeleteAccount` - Handles account deletion
+
+2. **Storage Methods**:
+
+   - `ReadAccountStorage` - Reads contract storage
+   - `WriteAccountStorage` - Writes contract storage
+
+3. **Code Methods**:
+
+   - `ReadAccountCode` - Reads contract code
+   - `UpdateAccountCode` - Stores contract code
+
+4. **Transaction Methods**:
+
+   - `HandleTransaction` - Stores transaction data
+   - `StoreReceipt` - Stores transaction receipts and logs
+
+5. **Block Methods**:
+   - `WriteBlockStart` - Initializes block data
+   - `StoreBlockInfo` - Stores block header and state
+   - `WriteChangeSets` - Updates canonical chain
+   - `WriteHistory` - Handles special cases like reorgs
+
+### factory.go
+
+Manages Redis client and writer lifecycle:
+
+1. **Initialization**:
+
+   - `InitializeRedisClient` - Sets up Redis connection
+   - `DiagnoseRedisConnection` - Verifies Redis health
+
+2. **Writer Factory**:
+
+   - `CreateRedisWriter` - Creates appropriate writer for block
+   - `GetRedisWriterFactoryFn` - Factory function registration
+
+3. **Reorg Handling**:
+   - `HandleChainReorg` - Updates Redis during chain reorgs
+
+### state_provider.go
+
+Implements provider interfaces for RPC access:
+
+1. **Account Queries**:
+
+   - `BalanceAt` - Gets account balance
+   - `NonceAt` - Gets account nonce
+   - `CodeAt` - Gets contract code
+
+2. **Transaction Queries**:
+
+   - `GetTransactionByHash` - Retrieves transactions
+   - `GetTransactionReceipt` - Retrieves receipts
+
+3. **Log Queries**:
+   - `GetLogs` - Filters logs by criteria
+
+## Configuration and Usage
+
+To enable Redis integration, add these flags to your Erigon command:
+
+```bash
+erigon --redis.enabled=true --redis.url="redis://localhost:6379/0" --redis.password="password" [other flags]
+```
+
+## Verification
+
+To verify the Redis integration is working:
+
+1. **Run the Redis Check Tool**:
+
+```bash
+go build -o build/bin/redis-check ./cmd/redis-check
+build/bin/redis-check --url="redis://localhost:6379/0" --password="password" --write-test --check-keys
+```
+
+2. **Check Redis Data**:
+
+```bash
+redis-cli -a password
+
+# Check for keys
+> KEYS *
+
+# Check account data
+> ZRANGE account:0x742d35Cc6634C0532925a3b844Bc454e4438f44e 0 -1 WITHSCORES
+
+# Check block data
+> HGETALL block:15000000
+```
+
+3. **Monitor Redis During Sync**:
+
+```bash
+redis-cli -a password MONITOR
+```
+
+## Troubleshooting
+
+1. **No Data in Redis**:
+
+   - Verify Redis connection is successful in logs
+   - Check if Redis is enabled with the correct flags
+   - Ensure Erigon is processing new blocks (not idle)
+
+2. **Missing Data Types**:
+
+   - If accounts appear but no transactions, check `HandleTransaction` integration
+   - If blocks appear but no state, check `CommitBlock` integration
+
+3. **Performance Issues**:
+   - Enable pipelining for better performance
+   - Consider Redis cluster for large-scale deployments
+   - Implement pruning for historical data
+
+## Extending the Integration
+
+To add new data types to Redis:
+
+1. Add new key patterns in `redis_state.go`
+2. Implement corresponding read/write methods
+3. Hook into appropriate execution points
+4. Update the provider interface for RPC access

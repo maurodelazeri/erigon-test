@@ -96,6 +96,14 @@ func ExecuteBlockEphemerally(
 	block.Uncles()
 	ibs := state.New(stateReader)
 	header := block.Header()
+	
+	// Set block context for Redis state integration
+	// This is critical for Redis to track the block number
+	ibs.SetBlockContext(header.Number.Uint64())
+	
+	if state.IsRedisEnabled() {
+		logger.Debug("Redis state integration: set block context", "block", header.Number.Uint64())
+	}
 
 	usedGas := new(uint64)
 	usedBlobGas := new(uint64)
