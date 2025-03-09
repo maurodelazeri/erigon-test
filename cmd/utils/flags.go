@@ -283,42 +283,6 @@ var (
 		Name:  "fakepow",
 		Usage: "Disables proof-of-work verification",
 	}
-	// Redis state integration settings
-	RedisStateEnabledFlag = cli.BoolFlag{
-		Name:  "redis.enabled",
-		Usage: "Enable Redis state mirroring for O(1) historical state access",
-		Value: false,
-	}
-	RedisStateURLFlag = cli.StringFlag{
-		Name:  "redis.url", 
-		Usage: "Redis connection URL",
-		Value: "redis://localhost:6379/0",
-	}
-	RedisStatePasswordFlag = cli.StringFlag{
-		Name:  "redis.password",
-		Usage: "Redis password (optional)",
-		Value: "",
-	}
-	RedisStatePoolSizeFlag = cli.IntFlag{
-		Name:  "redis.poolsize",
-		Usage: "Redis connection pool size",
-		Value: 10,
-	}
-	RedisStateMaxRetriesFlag = cli.IntFlag{
-		Name:  "redis.maxretries",
-		Usage: "Redis maximum retries",
-		Value: 3,
-	}
-	RedisStateTimeoutFlag = cli.DurationFlag{
-		Name:  "redis.timeout",
-		Usage: "Redis connection timeout",
-		Value: 5 * time.Second,
-	}
-	RedisStateLogLevelFlag = cli.StringFlag{
-		Name:  "redis.loglevel",
-		Usage: "Redis state integration log level",
-		Value: "info",
-	}
 	// RPC settings
 	IPCDisabledFlag = cli.BoolFlag{
 		Name:  "ipcdisable",

@@ -42,7 +42,6 @@ import (
 	"github.com/erigontech/erigon/eth/gasprice/gaspricecfg"
 	"github.com/erigontech/erigon/ethdb/prune"
 	"github.com/erigontech/erigon/params"
-	redisstate "github.com/erigontech/erigon/redis-state"
 	"github.com/erigontech/erigon/rpc"
 	"github.com/erigontech/erigon/txnprovider/shutter"
 	"github.com/erigontech/erigon/txnprovider/txpool/txpoolcfg"
@@ -263,9 +262,6 @@ type Config struct {
 	// PoS Single Slot finality
 	PolygonPosSingleSlotFinality        bool
 	PolygonPosSingleSlotFinalityBlockAt uint64
-	
-	// Redis state integration
-	RedisState redisstate.Config
 }
 
 type Sync struct {

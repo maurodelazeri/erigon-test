@@ -244,13 +244,4 @@ var DefaultFlags = []cli.Flag{
 
 	&utils.PolygonPosSingleSlotFinalityFlag,
 	&utils.PolygonPosSingleSlotFinalityBlockAtFlag,
-	
-	// Redis state integration flags
-	&utils.RedisStateEnabledFlag,
-	&utils.RedisStateURLFlag,
-	&utils.RedisStatePasswordFlag,
-	&utils.RedisStatePoolSizeFlag,
-	&utils.RedisStateMaxRetriesFlag,
-	&utils.RedisStateTimeoutFlag,
-	&utils.RedisStateLogLevelFlag,
 }

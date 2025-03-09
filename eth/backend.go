@@ -117,7 +117,6 @@ import (
 	"github.com/erigontech/erigon/polygon/bridge"
 	"github.com/erigontech/erigon/polygon/heimdall"
 	polygonsync "github.com/erigontech/erigon/polygon/sync"
-	redisstate "github.com/erigontech/erigon/redis-state"
 	"github.com/erigontech/erigon/rpc"
 	"github.com/erigontech/erigon/turbo/builder"
 	"github.com/erigontech/erigon/turbo/engineapi"
@@ -225,9 +224,6 @@ type Ethereum struct {
 	heimdallService     *heimdall.Service
 	stopNode            func() error
 	bgComponentsEg      errgroup.Group
-	
-	// Redis state integration
-	redisIntegration    *redisstate.RedisIntegration
 }
 
 func splitAddrIntoHostAndPort(addr string) (host string, port int, err error) {
@@ -367,150 +363,6 @@ func New(ctx context.Context, stack *node.Node, config *ethconfig.Config, logger
 	kvRPC := remotedbserver.NewKvServer(ctx, backend.chainDB, allSnapshots, allBorSnapshots, agg, logger)
 	backend.notifications = shards.NewNotifications(kvRPC)
 	backend.kvRPC = kvRPC
-	
-	// Initialize Redis state integration if enabled
-	if config.RedisState.Enabled {
-		var err error
-		backend.redisIntegration, err = redisstate.NewRedisIntegration(config.RedisState, logger)
-		if err != nil {
-			logger.Warn("Failed to initialize Redis state integration", "err", err)
-		} else if backend.redisIntegration != nil && backend.redisIntegration.IsEnabled() {
-			logger.Info("Redis state integration initialized successfully")
-			
-			// Wrap accumulator to capture state changes for Redis
-			if backend.notifications != nil && backend.notifications.Accumulator != nil {
-				// Get the current block number to use as the starting point for Redis integration
-				var currentBlockNum uint64 = 0
-				if err := backend.chainDB.View(context.Background(), func(tx kv.Tx) error {
-					headHash := rawdb.ReadHeadBlockHash(tx)
-					if headHash != (libcommon.Hash{}) {
-						headerNumber := rawdb.ReadHeaderNumber(tx, headHash)
-						if headerNumber != nil {
-							header := rawdb.ReadHeader(tx, headHash, *headerNumber)
-							if header != nil {
-								currentBlockNum = header.Number.Uint64()
-							}
-						}
-					}
-					return nil
-				}); err != nil {
-					logger.Error("Failed to get current block number for Redis integration", "err", err)
-				}
-				
-				logger.Error("REDIS INTEGRATION: Wrapping accumulator to capture state changes", 
-					"currentBlockNum", currentBlockNum)
-				
-				// Wrap the accumulator - THIS IS THE CRITICAL PART!
-				wrappedAcc := backend.redisIntegration.WrapAccumulator(backend.notifications.Accumulator, currentBlockNum)
-				
-				// IMPORTANT: Make sure to use the wrapped accumulator!
-				backend.notifications.Accumulator = wrappedAcc
-				
-				// Log success to verify it happened
-				logger.Error("REDIS INTEGRATION: Successfully wrapped accumulator for Redis integration")
-				
-				// Add a polling hook to process blocks periodically
-				go func() {
-					pollInterval := 5 * time.Second
-					ticker := time.NewTicker(pollInterval)
-					defer ticker.Stop()
-					
-					var lastProcessedBlock uint64
-					
-					for {
-						select {
-						case <-ticker.C:
-							// Get current chain head
-							var currentHeader *types.Header
-							err := backend.chainDB.View(context.Background(), func(tx kv.Tx) error {
-								block, err := backend.blockReader.CurrentBlock(tx)
-								if err != nil {
-									return err
-								}
-								if block != nil {
-									currentHeader = block.Header()
-								}
-								return nil
-							})
-							
-							if err != nil {
-								logger.Error("REDIS INTEGRATION: Failed to get current block", "err", err)
-								continue
-							}
-							
-							if currentHeader != nil && currentHeader.Number.Uint64() > lastProcessedBlock {
-								blockNum := currentHeader.Number.Uint64()
-								
-								// Super aggressive logging
-								logger.Error("REDIS INTEGRATION: Processing new block via polling",
-									"number", blockNum,
-									"hash", currentHeader.Hash().Hex(),
-									"lastProcessed", lastProcessedBlock)
-									
-								fmt.Printf("\n\n!!! REDIS INTEGRATION: POLLING DETECTED NEW BLOCK: %d !!!\n\n", blockNum)
-								
-								// Get the full block
-								var block *types.Block
-								err := backend.chainDB.View(context.Background(), func(tx kv.Tx) error {
-									var err error
-									block, err = backend.blockReader.BlockByNumber(context.Background(), tx, blockNum)
-									return err
-								})
-								
-								if err != nil {
-									logger.Error("REDIS INTEGRATION: Failed to get block by number",
-										"number", blockNum,
-										"err", err)
-									continue
-								}
-								
-								// Process the block
-								if err := backend.redisIntegration.ProcessBlock(block, nil, logger); err != nil {
-									logger.Error("REDIS INTEGRATION: Failed to process block",
-										"number", blockNum,
-										"hash", block.Hash().Hex(),
-										"err", err)
-								} else {
-									logger.Error("REDIS INTEGRATION: Successfully processed block",
-										"number", blockNum,
-										"hash", block.Hash().Hex())
-										
-									// Update last processed
-									lastProcessedBlock = blockNum
-									
-									// Try to add some direct test writes to verify Redis connectivity
-									testKey := fmt.Sprintf("redis_polling_test_%d", blockNum)
-									testValue := fmt.Sprintf("Block %d processed by polling at %s", 
-										blockNum, time.Now().Format(time.RFC3339))
-										
-									// Use a direct Redis client call to test
-									redisCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-									err := backend.redisIntegration.GetClient().Set(redisCtx, testKey, testValue, 24*time.Hour).Err()
-									cancel()
-									
-									if err != nil {
-										logger.Error("REDIS INTEGRATION: Direct Redis test failed",
-											"key", testKey,
-											"err", err)
-									} else {
-										logger.Error("REDIS INTEGRATION: Direct Redis test succeeded",
-											"key", testKey)
-									}
-								}
-							}
-						case <-ctx.Done():
-							return
-						}
-					}
-				}()
-				
-				logger.Info("Redis integration: added polling hook to process blocks")
-			}
-			
-			// No additional block processing needed - state shadowing is sufficient
-			logger.Info("Redis state shadowing active - all state changes are mirrored in real-time")
-		}
-	}
 
 	backend.gasPrice, _ = uint256.FromBig(config.Miner.GasPrice)
 
@@ -1823,11 +1675,6 @@ func (s *Ethereum) Start() error {
 
 // Stop implements node.Service, terminating all internal goroutines used by the
 // Ethereum protocol.
-// Note: The Redis state integration is fully managed by StateInterceptor.
-// It directly mirrors all Erigon state changes to Redis in real-time.
-// No additional block processing is needed, as we are shadowing the client's state.
-// This approach naturally handles reorgs because we follow exactly what the client does.
-
 func (s *Ethereum) Stop() error {
 	// Stop all the peer-related stuff first.
 	s.sentryCancel()
@@ -1880,13 +1727,6 @@ func (s *Ethereum) Stop() error {
 
 	if err := s.bgComponentsEg.Wait(); err != nil && !errors.Is(err, context.Canceled) {
 		s.logger.Error("background component error", "err", err)
-	}
-	
-	// Close Redis integration if enabled
-	if s.redisIntegration != nil {
-		if err := s.redisIntegration.Close(); err != nil {
-			s.logger.Error("Failed to close Redis integration", "err", err)
-		}
 	}
 
 	return nil

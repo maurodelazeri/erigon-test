@@ -268,25 +268,11 @@ var (
 	}
 )
 
-// ApplyRedisStateFlags applies the Redis state configuration flags to the ethconfig
-func ApplyRedisStateFlags(ctx *cli.Context, cfg *ethconfig.Config) {
-	cfg.RedisState.Enabled = ctx.Bool(utils.RedisStateEnabledFlag.Name)
-	cfg.RedisState.RedisURL = ctx.String(utils.RedisStateURLFlag.Name)
-	cfg.RedisState.RedisPass = ctx.String(utils.RedisStatePasswordFlag.Name)
-	cfg.RedisState.PoolSize = ctx.Int(utils.RedisStatePoolSizeFlag.Name)
-	cfg.RedisState.MaxRetries = ctx.Int(utils.RedisStateMaxRetriesFlag.Name)
-	cfg.RedisState.Timeout = ctx.Duration(utils.RedisStateTimeoutFlag.Name)
-	cfg.RedisState.LogLevel = ctx.String(utils.RedisStateLogLevelFlag.Name)
-}
-
 func ApplyFlagsForEthConfig(ctx *cli.Context, cfg *ethconfig.Config, logger log.Logger) {
 	chainId := cfg.NetworkID
 	if cfg.Genesis != nil {
 		chainId = cfg.Genesis.Config.ChainID.Uint64()
 	}
-	
-	// Apply Redis state integration flags
-	ApplyRedisStateFlags(ctx, cfg)
 	// Sanitize prune flag
 	if ctx.String(PruneModeFlag.Name) != "archive" && (ctx.IsSet(PruneBlocksDistanceFlag.Name) || ctx.IsSet(PruneDistanceFlag.Name)) {
 		utils.Fatalf("error: --prune.distance and --prune.distance.blocks are only allowed with --prune.mode=archive")

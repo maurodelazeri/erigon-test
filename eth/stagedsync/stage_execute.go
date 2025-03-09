@@ -27,7 +27,6 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"github.com/erigontech/erigon/cmd/state/exec3"
-	redisstate "github.com/erigontech/erigon/redis-state"
 
 	"github.com/erigontech/erigon-lib/chain"
 	"github.com/erigontech/erigon-lib/common"
@@ -92,9 +91,6 @@ type ExecuteBlockCfg struct {
 	blockProduction bool
 
 	applyWorker, applyWorkerMining *exec3.Worker
-	
-	// Redis integration for block processing
-	redisIntegration *redisstate.RedisIntegration
 }
 
 func StageExecuteBlocksCfg(
@@ -114,13 +110,7 @@ func StageExecuteBlocksCfg(
 	genesis *types.Genesis,
 	syncCfg ethconfig.Sync,
 	silkworm *silkworm.Silkworm,
-	redisIntegration ...interface{},
 ) ExecuteBlockCfg {
-	// Handle the redis integration as an optional parameter
-	var redisInt *redisstate.RedisIntegration
-	if len(redisIntegration) > 0 && redisIntegration[0] != nil {
-		redisInt, _ = redisIntegration[0].(*redisstate.RedisIntegration)
-	}
 	if dirs.SnapDomain == "" {
 		panic("empty `dirs` variable")
 	}
@@ -134,7 +124,6 @@ func StageExecuteBlocksCfg(
 		vmConfig:          vmConfig,
 		dirs:              dirs,
 		notifications:     notifications,
-		redisIntegration:  redisInt,
 		stateStream:       stateStream,
 		badBlockHalt:      badBlockHalt,
 		blockReader:       blockReader,

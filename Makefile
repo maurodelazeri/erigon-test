@@ -153,7 +153,6 @@ COMMANDS += sentinel
 COMMANDS += caplin
 COMMANDS += snapshots
 COMMANDS += diag
-COMMANDS += redis-state
 
 # build each command using %.cmd rule
 $(COMMANDS): %: %.cmd
