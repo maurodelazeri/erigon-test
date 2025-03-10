@@ -244,4 +244,6 @@ var DefaultFlags = []cli.Flag{
 
 	&utils.PolygonPosSingleSlotFinalityFlag,
 	&utils.PolygonPosSingleSlotFinalityBlockAtFlag,
+	&utils.RedisURLFlag,
+	&utils.RedisPasswordFlag,
 }

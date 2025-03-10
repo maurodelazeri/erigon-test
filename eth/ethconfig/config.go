@@ -262,6 +262,10 @@ type Config struct {
 	// PoS Single Slot finality
 	PolygonPosSingleSlotFinality        bool
 	PolygonPosSingleSlotFinalityBlockAt uint64
+	
+	// Redis state configuration
+	RedisURL      string
+	RedisPassword string
 }
 
 type Sync struct {

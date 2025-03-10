@@ -140,6 +140,7 @@ func SpawnMiningExecStage(s *StageState, txc wrap.TxContainer, cfg MiningExecCfg
 			return err
 		}
 		defer sd.Close()
+		// Use regular StateWriter for simulation, no need for Redis here
 		simStateWriter = state.NewWriterV4(sd)
 		simStateReader = state.NewReaderV3(sd)
 

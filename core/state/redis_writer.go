@@ -2,6 +2,7 @@ package state
 
 import (
 	libcommon "github.com/erigontech/erigon-lib/common"
+	"github.com/erigontech/erigon-lib/kv"
 	"github.com/erigontech/erigon-lib/types/accounts"
 	"github.com/holiman/uint256"
 )
@@ -22,6 +23,21 @@ func NewStateWriterWithRedis(underlying StateWriter, blockNum uint64, blockHash 
 		blockNum:   blockNum,
 		blockHash:  blockHash,
 	}
+}
+
+// WrapStateWriter wraps a StateWriter with Redis integration if Redis is enabled
+func WrapStateWriter(writer StateWriter, blockNum uint64, blockHash libcommon.Hash) StateWriter {
+	redis := GetRedisState()
+	if redis.Enabled() {
+		return NewStateWriterWithRedis(writer, blockNum, blockHash)
+	}
+	return writer
+}
+
+// CreateRedisEnabledWriter creates a new WriterV4 with Redis integration if enabled
+func CreateRedisEnabledWriter(tx kv.TemporalPutDel, blockNum uint64, blockHash libcommon.Hash) StateWriter {
+	writer := NewWriterV4(tx)
+	return WrapStateWriter(writer, blockNum, blockHash)
 }
 
 // UpdateAccountData updates account data and writes to Redis

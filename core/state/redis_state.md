@@ -6,13 +6,12 @@ The Redis state integration for Erigon enables storing blockchain state, transac
 
 ## Component Architecture
 
-Our implementation consists of three main components:
+Our implementation consists of two main components:
 
 1. **RedisState** (`redis_state.go`) - Core Redis client and state management
-2. **StateWriterWithRedis** (`redis_writer.go`) - Redis-enabled wrapper for state modifications
-3. **RedisStateV3** (`redis_state_v3.go`) - Redis-enabled StateV3 for transaction processing
+2. **RedisStateMonitor** (`redis_state_v3.go`) - Monitor for capturing block, transaction, and receipt data
 
-The components work together to capture state changes during block processing and handle chain reorganizations.
+The implementation uses a shadowing approach that captures state changes directly in state writing methods rather than using wrapper classes. This provides better integration with minimal modifications to the core codebase.
 
 ## File Descriptions
 
@@ -43,55 +42,58 @@ The components work together to capture state changes during block processing an
 - Blocks, transactions, and receipts indexed by hash and block number
 - Logs indexed by address and topic for efficient querying
 
-### 2. `redis_writer.go`
+### 2. `redis_state_v3.go`
 
-**Purpose:** Wraps the standard Erigon StateWriter to capture state changes and store them in Redis.
-
-**Key Components:**
-
-- **StateWriterWithRedis** - Wrapper that decorates a standard StateWriter
-- **State Change Methods** - Override methods to intercept state modifications
-
-**How It Works:**
-
-1. Each state change is passed through to the underlying StateWriter
-2. In parallel, the change is also written to Redis
-3. Block number and hash are tracked to maintain chain identity
-4. All state operations (account updates, storage changes, code updates) are captured
-
-### 3. `redis_state_v3.go`
-
-**Purpose:** Extends Erigon's StateV3 implementation to incorporate Redis storage during transaction execution.
+**Purpose:** Provides monitoring capabilities to capture block, transaction, and receipt data during execution.
 
 **Key Components:**
 
-- **RedisStateV3** - Wrapper that delegates to a standard StateV3 instance
-- **Method Overrides** - Custom implementations for ApplyState4 and Unwind
-- **Forwarding Methods** - Pass-through for most StateV3 functionality
+- **RedisStateMonitor** - Monitors state changes for Redis integration
+- **Monitoring Methods** - Functions to record block, transaction, and receipt data
+- **Chain Reorganization Handler** - Special handling for chain reorganizations
 
 **How It Works:**
 
-1. Most operations are delegated to the underlying StateV3 implementation
-2. Block and transaction data is captured during ApplyState4
-3. Chain reorganizations are handled in the Unwind method
-4. The Redis pipeline is flushed periodically to optimize performance
+1. Block data is captured in the execution flow during block processing
+2. Transaction data is captured when transactions are executed
+3. Receipt data is captured after transactions are processed
+4. Chain reorganizations are properly handled to maintain data consistency
+
+### 3. State Writing Integration
+
+**Purpose:** Direct integration with Erigon's state writing methods to capture state changes.
+
+**Key Components:**
+
+- **Direct Integration** - State writing methods (UpdateAccountData, etc.) directly write to Redis when enabled
+- **Block Number Tracking** - Block number is used as the primary index for historical state
+- **Zero Hash Handling** - A zero hash is used in state writers since actual block hash isn't available
+
+**How It Works:**
+
+1. State writing methods check if Redis is enabled
+2. If enabled, they write state changes directly to Redis while performing normal operations
+3. The Redis pipeline is explicitly flushed when a block is committed in `flushAndCheckCommitmentV3`, ensuring Redis is always in sync with the client's state
+4. This approach minimizes code changes while ensuring all state changes are correctly captured
 
 ## Data Flow and Interaction
 
 1. **Block Processing:**
 
-   - When a block is processed, RedisStateV3 captures block header and metadata
-   - For each transaction, transaction data and receipt are stored in Redis
-   - State changes (account/storage/code) are captured by StateWriterWithRedis
+   - When a block is processed, RedisStateMonitor captures block header and metadata
+   - For each transaction, transaction data is recorded by the monitor
+   - After execution, receipt data is also captured by the monitor
 
 2. **State Modifications:**
 
-   - When state is modified, StateWriterWithRedis forwards changes to both Redis and the underlying StateWriter
-   - Account updates, storage changes, and code deployment are tracked with block numbers
+   - State changes are captured directly in the state writing methods
+   - When these methods are called, they check if Redis is enabled and write to it if so
+   - Account updates, storage changes, and code deployment are all tracked with block numbers
+   - A zero block hash is used since the state writers don't have access to the actual block hash
 
 3. **Chain Reorganizations:**
 
-   - When a reorg occurs, RedisStateV3.Unwind is called
+   - When a reorg occurs, RedisStateMonitor.MonitorUnwind is called
    - The handleReorg method completely removes all data from the non-canonical chain
    - Only canonical chain data remains in Redis, ensuring O(1) access times
 
@@ -120,9 +122,10 @@ The components work together to capture state changes during block processing an
    - Lua scripts handle bulk operations during reorgs
    - Periodic flushing balances performance and durability
 
-4. **Composition over Inheritance:**
-   - StateWriterWithRedis and RedisStateV3 use composition instead of inheritance
+4. **Direct State Integration:**
+   - State writing methods directly check and write to Redis rather than using wrapper classes
    - This minimizes changes to Erigon's core code and improves maintainability
+   - The approach is less intrusive while still ensuring all state changes are captured
 
 ## Usage Scenarios
 
@@ -144,3 +147,80 @@ The components work together to capture state changes during block processing an
 4. **Block and Transaction Lookup:**
    - Efficient access to block data, transactions, and receipts
    - Useful for block explorers and transaction tracking services
+
+--
+
+# Erigon's Extension Points for Redis Integration
+
+Erigon has a well-designed architecture that allows for integrating our Redis state functionality through key extension points:
+
+## Core Extension Points
+
+### 1. **Interface-based Design**
+
+Erigon uses interfaces for state management components:
+
+```go
+// StateWriter interface defines how state changes are written
+type StateWriter interface {
+    UpdateAccountData(address libcommon.Address, original, account *accounts.Account) error
+    // other methods...
+}
+```
+
+### 2. **Direct Method Integration**
+
+State changes are captured directly in the state writing methods:
+
+```go
+// In StateWriterV3.UpdateAccountData
+func (w *StateWriterV3) UpdateAccountData(address common.Address, original, account *accounts.Account) error {
+    // Standard operations
+    
+    // Redis integration - capture state changes directly
+    redisState := GetRedisState()
+    if redisState.Enabled() && w.rs.domains != nil {
+        redisState.writeAccount(w.rs.domains.BlockNum(), w.rs.domains.BlockHash(), address, account)
+    }
+    
+    // Regular state writing continues...
+}
+```
+
+## Specific Hook Points
+
+### 1. **State Modification Hooks**
+
+- `StateWriterV3` methods directly check for Redis and write to it when enabled
+- This avoids the need for wrapper classes while ensuring all state changes are captured
+
+### 2. **Block/Transaction Monitoring**
+
+- `RedisStateMonitor` is initialized in the execution flow
+- It captures block data, transaction data, and receipts at key points
+
+### 3. **Chain Reorganization Hooks**
+
+- `RedisStateMonitor.MonitorUnwind` is called during chain reorganizations
+- This ensures proper Redis state cleanup for non-canonical blocks
+
+## Integration Mechanism
+
+The process of integrating Redis with Erigon is minimal and non-intrusive:
+
+1. **Initial Configuration**
+
+   - Command-line flags define Redis URL and password
+   - Redis state is initialized when Erigon starts
+
+2. **Direct Integration**
+
+   - State writing methods directly check if Redis is enabled
+   - If enabled, they write to Redis in addition to their normal operations
+   - This approach requires minimal changes to the core codebase
+
+3. **Monitoring Integration**
+   - Block, transaction, and receipt data are captured via monitoring
+   - This ensures all blockchain data is properly shadowed to Redis
+
+This direct integration approach allows our Redis functionality to work as a non-intrusive layer on top of Erigon's core functionality while capturing all state changes.

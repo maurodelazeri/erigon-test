@@ -28,6 +28,7 @@ import (
 	"github.com/holiman/uint256"
 
 	"github.com/erigontech/erigon-lib/common"
+	libcommon "github.com/erigontech/erigon-lib/common"
 	"github.com/erigontech/erigon-lib/common/dbg"
 	"github.com/erigontech/erigon-lib/common/length"
 	"github.com/erigontech/erigon-lib/etl"
@@ -40,6 +41,8 @@ import (
 )
 
 var execTxsDone = metrics.NewCounter(`exec_txs_done`)
+
+// Remove the periodic flushing approach - we'll rely on block commit flushing
 
 type StateV3 struct {
 	domains      *libstate.SharedDomains
@@ -489,6 +492,15 @@ func (w *StateWriterV3) UpdateAccountData(address common.Address, original, acco
 		w.accumulator.ChangeAccount(address, account.Incarnation, value)
 	}
 
+	// Write to Redis if enabled
+	redisState := GetRedisState()
+	if redisState.Enabled() && w.rs.domains != nil {
+		// Note: We're using a zero hash here as we don't have access to the block hash
+		// This is acceptable for this implementation as the main data lookup is by block number
+		var zeroHash libcommon.Hash
+		redisState.writeAccount(w.rs.domains.BlockNum(), zeroHash, address, account)
+	}
+
 	if err := w.rs.domains.DomainPut(kv.AccountsDomain, address[:], nil, value, nil, 0); err != nil {
 		return err
 	}
@@ -499,6 +511,13 @@ func (w *StateWriterV3) UpdateAccountCode(address common.Address, incarnation ui
 	if w.trace {
 		fmt.Printf("code: %x, %x, valLen: %d\n", address.Bytes(), codeHash, len(code))
 	}
+
+	// Write to Redis if enabled
+	redisState := GetRedisState()
+	if redisState.Enabled() && len(code) > 0 {
+		redisState.writeCode(codeHash, code)
+	}
+
 	if err := w.rs.domains.DomainPut(kv.CodeDomain, address[:], nil, code, nil, 0); err != nil {
 		return err
 	}
@@ -512,6 +531,15 @@ func (w *StateWriterV3) DeleteAccount(address common.Address, original *accounts
 	if w.trace {
 		fmt.Printf("del acc: %x\n", address)
 	}
+
+	// Record deletion in Redis if enabled
+	redisState := GetRedisState()
+	if redisState.Enabled() && w.rs.domains != nil {
+		// Note: We're using a zero hash here as we don't have access to the block hash
+		var zeroHash libcommon.Hash
+		redisState.deleteAccount(w.rs.domains.BlockNum(), zeroHash, address)
+	}
+
 	if err := w.rs.domains.DomainDel(kv.AccountsDomain, address[:], nil, nil, 0); err != nil {
 		return err
 	}
@@ -530,6 +558,15 @@ func (w *StateWriterV3) WriteAccountStorage(address common.Address, incarnation 
 	if w.trace {
 		fmt.Printf("storage: %x,%x,%x\n", address, *key, v)
 	}
+
+	// Write storage change to Redis if enabled
+	redisState := GetRedisState()
+	if redisState.Enabled() && w.rs.domains != nil && key != nil {
+		// Note: We're using a zero hash here as we don't have access to the block hash
+		var zeroHash libcommon.Hash
+		redisState.writeStorage(w.rs.domains.BlockNum(), zeroHash, address, key, value)
+	}
+
 	if len(v) == 0 {
 		return w.rs.domains.DomainDel(kv.StorageDomain, composite, nil, nil, 0)
 	}

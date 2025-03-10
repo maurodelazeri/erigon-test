@@ -308,7 +308,17 @@ func ExecV3(ctx context.Context,
 			accumulator = shards.NewAccumulator()
 		}
 	}
+
+	// Create StateV3 for core state tracking
 	rs := state.NewStateV3(doms, logger)
+
+	// Initialize Redis if configured, but don't replace StateV3
+	var redisMonitor *state.RedisStateMonitor
+	redisState := state.GetRedisState()
+	if redisState.Enabled() {
+		redisMonitor = state.NewRedisStateMonitor()
+		logger.Info("Redis state shadowing enabled")
+	}
 
 	////TODO: owner of `resultCh` is main goroutine, but owner of `retryQueue` is applyLoop.
 	// Now rwLoop closing both (because applyLoop we completely restart)
@@ -573,6 +583,11 @@ Loop:
 				if err != nil {
 					return err
 				}
+
+				// If Redis monitoring is enabled, log transaction data
+				if redisMonitor != nil && txTask.Tx != nil {
+					redisMonitor.MonitorTransaction(txTask.BlockNum, txTask.BlockHash, txTask.Tx, txIndex)
+				}
 			}
 
 			txTasks = append(txTasks, txTask)
@@ -836,6 +851,20 @@ func handleIncorrectRootHashError(header *types.Header, applyTx kv.RwTx, cfg Exe
 
 // flushAndCheckCommitmentV3 - does write state to db and then check commitment
 func flushAndCheckCommitmentV3(ctx context.Context, header *types.Header, applyTx kv.RwTx, doms *state2.SharedDomains, cfg ExecuteBlockCfg, e *StageState, maxBlockNum uint64, parallel bool, logger log.Logger, u Unwinder, inMemExec bool) (bool, error) {
+	// If Redis monitoring is enabled, update the block data and flush all pending Redis operations
+	redisState := state.GetRedisState()
+
+	fmt.Println("flushAndCheckCommitmentV3", redisState.Enabled())
+
+	if redisState.Enabled() && header != nil {
+		// First, flush any pending Redis operations from state changes
+		redisState.FlushPipeline()
+
+		// Then record and flush block data
+		monitor := state.NewRedisStateMonitor()
+		monitor.MonitorBlockData(header, header.Hash())
+		defer monitor.FlushData()
+	}
 
 	// E2 state root check was in another stage - means we did flush state even if state root will not match
 	// And Unwind expecting it

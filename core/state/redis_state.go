@@ -44,7 +44,7 @@ type AccountJSON struct {
 }
 
 // Initialize creates or returns the global RedisState instance
-func InitRedisState(redisURL string, logger log.Logger) *RedisState {
+func InitRedisState(redisURL string, redisPassword string, logger log.Logger) *RedisState {
 	redisInitOnce.Do(func() {
 		if redisURL == "" {
 			redisState = &RedisState{
@@ -55,11 +55,24 @@ func InitRedisState(redisURL string, logger log.Logger) *RedisState {
 			return
 		}
 
-		client := redis.NewClient(&redis.Options{
-			Addr:     redisURL,
-			Password: "", // Can be configured from env vars if needed
-			DB:       0,  // Default DB
-		})
+		// Parse Redis URL to extract address and DB
+		opts, err := redis.ParseURL(redisURL)
+		if err != nil {
+			logger.Error("Invalid Redis URL format", "url", redisURL, "error", err)
+			redisState = &RedisState{
+				enabled: false,
+				logger:  logger,
+				ctx:     context.Background(),
+			}
+			return
+		}
+
+		// Override password if provided
+		if redisPassword != "" {
+			opts.Password = redisPassword
+		}
+
+		client := redis.NewClient(opts)
 
 		// Test connection
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -122,7 +135,7 @@ func (rs *RedisState) Close() error {
 		return nil
 	}
 
-	rs.flushPipeline() // Ensure all commands are sent
+	rs.FlushPipeline() // Ensure all commands are sent
 
 	if rs.client != nil {
 		return rs.client.Close()
@@ -148,8 +161,9 @@ func (rs *RedisState) beginBlockProcessing(blockNum uint64) {
 	}
 }
 
-// flushPipeline sends all queued commands to Redis
-func (rs *RedisState) flushPipeline() {
+// FlushPipeline sends all queued commands to Redis
+// This is exported to allow explicit flushing at commit points
+func (rs *RedisState) FlushPipeline() {
 	if !rs.enabled {
 		return
 	}
@@ -171,6 +185,8 @@ func (rs *RedisState) writeAccount(blockNum uint64, blockHash libcommon.Hash, ad
 	if !rs.enabled || account == nil {
 		return
 	}
+
+	rs.logger.Debug("Writing account to Redis", "address", address.Hex(), "nonce", account.Nonce, "balance", account.Balance.ToBig().String(), "block", blockNum)
 
 	accountJSON := AccountJSON{
 		Balance:     account.Balance.ToBig().String(),
@@ -577,7 +593,7 @@ func (rs *RedisState) handleReorg(reorgFromBlock uint64, newCanonicalHash libcom
 	rs.blockMutex.Unlock()
 
 	// Execute all deletion commands
-	rs.flushPipeline()
+	rs.FlushPipeline()
 
 	rs.logger.Info("Chain reorganization completed", "fromBlock", reorgFromBlock)
 }

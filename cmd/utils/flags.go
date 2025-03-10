@@ -1101,6 +1101,16 @@ var (
 		Usage: "Enable 'chaos monkey' to generate spontaneous network/consensus/etc failures. Use ONLY for testing",
 		Value: false,
 	}
+	RedisURLFlag = cli.StringFlag{
+		Name:  "redis.url",
+		Usage: "Redis server URL for state caching (e.g. 'redis://localhost:6379/0')",
+		Value: "",
+	}
+	RedisPasswordFlag = cli.StringFlag{
+		Name:  "redis.password",
+		Usage: "Password for Redis server authentication",
+		Value: "",
+	}
 	ShutterEnabledFlag = cli.BoolFlag{
 		Name:  "shutter",
 		Usage: "Enable the Shutter encrypted transactions mempool (defaults to false)",
@@ -1875,6 +1885,10 @@ func CheckExclusive(ctx *cli.Context, args ...interface{}) {
 
 // SetEthConfig applies eth-related command line flags to the config.
 func SetEthConfig(ctx *cli.Context, nodeConfig *nodecfg.Config, cfg *ethconfig.Config, logger log.Logger) {
+	// Set Redis configuration
+	cfg.RedisURL = ctx.String(RedisURLFlag.Name)
+	cfg.RedisPassword = ctx.String(RedisPasswordFlag.Name)
+	
 	cfg.CaplinConfig.CaplinDiscoveryAddr = ctx.String(CaplinDiscoveryAddrFlag.Name)
 	cfg.CaplinConfig.CaplinDiscoveryPort = ctx.Uint64(CaplinDiscoveryPortFlag.Name)
 	cfg.CaplinConfig.CaplinDiscoveryTCPPort = ctx.Uint64(CaplinDiscoveryTCPPortFlag.Name)

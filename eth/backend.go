@@ -91,6 +91,7 @@ import (
 	"github.com/erigontech/erigon/core"
 	"github.com/erigontech/erigon/core/rawdb"
 	"github.com/erigontech/erigon/core/rawdb/blockio"
+	"github.com/erigontech/erigon/core/state"
 	snaptype2 "github.com/erigontech/erigon/core/snaptype"
 	"github.com/erigontech/erigon/core/types"
 	"github.com/erigontech/erigon/core/vm"
@@ -1099,6 +1100,12 @@ func (s *Ethereum) Init(stack *node.Node, config *ethconfig.Config, chainConfig 
 	ctx := s.sentryCtx
 	chainKv := s.chainDB
 	var err error
+	
+	// Initialize Redis connection if configured
+	if config.RedisURL != "" {
+		state.InitRedisState(config.RedisURL, config.RedisPassword, s.logger)
+		s.logger.Info("Redis state integration enabled", "url", config.RedisURL)
+	}
 
 	if chainConfig.Bor == nil {
 		s.sentriesClient.Hd.StartPoSDownloader(s.sentryCtx, s.sentriesClient.SendHeaderRequest, s.sentriesClient.Penalize)
@@ -1722,6 +1729,14 @@ func (s *Ethereum) Stop() error {
 	if s.silkworm != nil {
 		if err := s.silkworm.Close(); err != nil {
 			s.logger.Error("silkworm.Close error", "err", err)
+		}
+	}
+	
+	// Close the Redis connection if it's open
+	redisState := state.GetRedisState()
+	if redisState.Enabled() {
+		if err := redisState.Close(); err != nil {
+			s.logger.Error("redis.Close error", "err", err)
 		}
 	}
 
