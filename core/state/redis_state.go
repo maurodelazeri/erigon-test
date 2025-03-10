@@ -23,7 +23,6 @@ type RedisState struct {
 	enabled       bool
 	url           string
 	logger        log.Logger
-	mutex         sync.RWMutex
 	currentBlock  uint64
 	blockMutex    sync.RWMutex
 	pipeline      redis.Pipeliner
@@ -294,7 +293,7 @@ func (rs *RedisState) writeBlock(block *types.Header, blockHash libcommon.Hash) 
 	rs.pipelineMutex.Lock()
 	defer rs.pipelineMutex.Unlock()
 
-	// Set block data
+	// Set block data - indexed by block number
 	blockKey := fmt.Sprintf("block:%d", blockNum)
 	rs.pipeline.HSet(rs.ctx, blockKey, map[string]interface{}{
 		"hash":       blockHash.Hex(),
@@ -338,23 +337,16 @@ func (rs *RedisState) writeTx(blockNum uint64, blockHash libcommon.Hash, tx type
 		return
 	}
 
-	// Add transaction to Redis
-	txKey := fmt.Sprintf("tx:%s", txHash.Hex())
-	rs.pipeline.ZAdd(rs.ctx, txKey, redis.Z{
-		Score:  float64(blockNum),
-		Member: string(txData),
-	})
+	// Store transaction directly in the block key
+	blockTxsKey := fmt.Sprintf("txs:%d", blockNum)
+	rs.pipeline.HSet(rs.ctx, blockTxsKey, fmt.Sprintf("%d", txIndex), string(txData))
 
-	// Store transaction metadata
-	rs.pipeline.HSet(rs.ctx, fmt.Sprintf("%s:meta", txKey), map[string]interface{}{
-		"blockHash": blockHash.Hex(),
-		"blockNum":  blockNum,
-		"txIndex":   txIndex,
-	})
-
-	// Add to block's transaction list
+	// Add transaction hash to block's transaction list for reference
 	rs.pipeline.SAdd(rs.ctx, fmt.Sprintf("block:%d:txs", blockNum), txHash.Hex())
-	rs.pipeline.HSet(rs.ctx, fmt.Sprintf("block:%s:txs", blockHash.Hex()), fmt.Sprintf("%d", txIndex), txHash.Hex())
+
+	// Map transaction hash to block number for lookups
+	txBlockKey := fmt.Sprintf("tx:%s:block", txHash.Hex())
+	rs.pipeline.Set(rs.ctx, txBlockKey, blockNum, 0)
 
 	// Store sender index if available
 	if ok {
@@ -374,9 +366,6 @@ func (rs *RedisState) writeReceipt(blockNum uint64, blockHash libcommon.Hash, re
 	rs.pipelineMutex.Lock()
 	defer rs.pipelineMutex.Unlock()
 
-	// Store receipt data in Redis
-	receiptKey := fmt.Sprintf("receipt:%s", receipt.TxHash.Hex())
-
 	// Encode receipt to binary
 	receiptData, err := rlp.EncodeToBytes(receipt)
 	if err != nil {
@@ -384,83 +373,25 @@ func (rs *RedisState) writeReceipt(blockNum uint64, blockHash libcommon.Hash, re
 		return
 	}
 
-	// Add receipt to Redis
-	rs.pipeline.ZAdd(rs.ctx, receiptKey, redis.Z{
-		Score:  float64(blockNum),
-		Member: string(receiptData),
-	})
+	// Store receipt directly in block-indexed hash
+	blockReceiptsKey := fmt.Sprintf("receipts:%d", blockNum)
+	rs.pipeline.HSet(rs.ctx, blockReceiptsKey, fmt.Sprintf("%d", receipt.TransactionIndex), string(receiptData))
 
-	// Store receipt metadata
-	rs.pipeline.HSet(rs.ctx, fmt.Sprintf("%s:meta", receiptKey), map[string]interface{}{
-		"blockHash": blockHash.Hex(),
-		"blockNum":  blockNum,
-		"txIndex":   receipt.TransactionIndex,
-	})
+	// Map receipt hash to block number for lookups
+	receiptBlockKey := fmt.Sprintf("receipt:%s:block", receipt.TxHash.Hex())
+	rs.pipeline.Set(rs.ctx, receiptBlockKey, blockNum, 0)
 
-	// Add to block's receipts list
+	// Add to block's receipts list (maintain reference by tx hash)
 	rs.pipeline.ZAdd(rs.ctx, fmt.Sprintf("block:%d:receipts", blockNum), redis.Z{
 		Score:  float64(receipt.TransactionIndex),
 		Member: receipt.TxHash.Hex(),
 	})
-
-	// Also index by block hash
-	rs.pipeline.HSet(rs.ctx, fmt.Sprintf("block:%s:receipts", blockHash.Hex()),
-		fmt.Sprintf("%d", receipt.TransactionIndex), receipt.TxHash.Hex())
-
-	// Process logs
-	for _, log := range receipt.Logs {
-		rs.writeLog(blockNum, blockHash, log)
-	}
 }
 
-// writeLog writes log data to Redis
+// logs have been removed from the Redis implementation
 func (rs *RedisState) writeLog(blockNum uint64, blockHash libcommon.Hash, log *types.Log) {
-	if !rs.enabled || log == nil {
-		return
-	}
-
-	// Add block hash to log data for chain tracking
-	log.BlockHash = blockHash
-
-	// Convert log to JSON
-	logData, err := json.Marshal(log)
-	if err != nil {
-		rs.logger.Error("Failed to marshal log", "block", blockNum, "txHash", log.TxHash, "error", err)
-		return
-	}
-
-	// Generate a unique log index
-	logIndex := (blockNum * 100000) + uint64(log.Index)
-	logKey := fmt.Sprintf("log:%d", logIndex)
-
-	// Store log data
-	rs.pipeline.Set(rs.ctx, logKey, logData, 0)
-
-	// Store log metadata
-	rs.pipeline.HSet(rs.ctx, fmt.Sprintf("%s:meta", logKey), map[string]interface{}{
-		"blockHash": blockHash.Hex(),
-		"blockNum":  blockNum,
-		"txHash":    log.TxHash.Hex(),
-		"logIndex":  log.Index,
-	})
-
-	// Index by address
-	rs.pipeline.ZAdd(rs.ctx, fmt.Sprintf("address:%s:logs", log.Address.Hex()), redis.Z{
-		Score:  float64(blockNum),
-		Member: strconv.FormatUint(logIndex, 10),
-	})
-
-	// Index by topics
-	for _, topic := range log.Topics {
-		rs.pipeline.ZAdd(rs.ctx, fmt.Sprintf("topic:%s", topic.Hex()), redis.Z{
-			Score:  float64(blockNum),
-			Member: strconv.FormatUint(logIndex, 10),
-		})
-	}
-
-	// Index by block hash
-	rs.pipeline.SAdd(rs.ctx, fmt.Sprintf("block:%s:logs", blockHash.Hex()),
-		strconv.FormatUint(logIndex, 10))
+	// No longer implemented - logs are not stored in Redis
+	return
 }
 
 // handleReorg handles chain reorganization in Redis by completely deleting non-canonical data
@@ -491,24 +422,13 @@ func (rs *RedisState) handleReorg(reorgFromBlock uint64, newCanonicalHash libcom
 		"timestamp": time.Now().Unix(),
 	})
 
-	// Delete all data from all blocks >= reorgFromBlock
-	cursor := uint64(0)
-	for {
-		var keys []string
-		var err error
-		keys, cursor, err = rs.client.Scan(rs.ctx, cursor, fmt.Sprintf("block:%d*", reorgFromBlock), 100).Result()
-		if err != nil {
-			rs.logger.Error("Error scanning keys during reorg", "error", err)
-			break
-		}
-
-		if len(keys) > 0 {
-			rs.pipeline.Del(rs.ctx, keys...)
-		}
-
-		if cursor == 0 {
-			break
-		}
+	// Delete all block data from reorgFromBlock and higher
+	for i := reorgFromBlock; i <= rs.currentBlock; i++ {
+		rs.pipeline.Del(rs.ctx, fmt.Sprintf("block:%d", i))
+		rs.pipeline.Del(rs.ctx, fmt.Sprintf("txs:%d", i))
+		rs.pipeline.Del(rs.ctx, fmt.Sprintf("receipts:%d", i))
+		rs.pipeline.Del(rs.ctx, fmt.Sprintf("block:%d:txs", i))
+		rs.pipeline.Del(rs.ctx, fmt.Sprintf("block:%d:receipts", i))
 	}
 
 	// Delete the block hash entry
@@ -536,53 +456,28 @@ func (rs *RedisState) handleReorg(reorgFromBlock uint64, newCanonicalHash libcom
 		return #keys
 	`, []string{}, fmt.Sprintf("%f", float64(reorgFromBlock)))
 
-	// 3. Delete block-specific indices
-	keys, err := rs.client.Keys(rs.ctx, fmt.Sprintf("block:%s:*", oldHash)).Result()
-	if err == nil && len(keys) > 0 {
-		rs.pipeline.Del(rs.ctx, keys...)
-	}
-
-	// 4. Delete all transaction data for this block and above
-	txHashes, err := rs.client.SMembers(rs.ctx, fmt.Sprintf("block:%d:txs", reorgFromBlock)).Result()
-	if err == nil {
-		for _, txHash := range txHashes {
-			// Delete tx at this block height
-			rs.pipeline.ZRemRangeByScore(rs.ctx, fmt.Sprintf("tx:%s", txHash),
-				fmt.Sprintf("%f", float64(reorgFromBlock)), "+inf")
-
-			// Delete receipt at this block height
-			rs.pipeline.ZRemRangeByScore(rs.ctx, fmt.Sprintf("receipt:%s", txHash),
-				fmt.Sprintf("%f", float64(reorgFromBlock)), "+inf")
-
-			// Delete metadata
-			rs.pipeline.Del(rs.ctx, fmt.Sprintf("tx:%s:meta", txHash))
-			rs.pipeline.Del(rs.ctx, fmt.Sprintf("receipt:%s:meta", txHash))
-		}
-	}
-
-	// 5. Delete logs for this block and above
+	// 3. Delete all tx and receipt mappings
 	rs.pipeline.Eval(rs.ctx, `
-		-- Find all log indices for the reorged block by address
-		local addrLogKeys = redis.call('keys', 'address:*:logs')
-		for i, key in ipairs(addrLogKeys) do
-			redis.call('zremrangebyscore', key, ARGV[1], '+inf')
+		-- Find all tx mappings for blocks >= reorgFromBlock
+		local txMappingKeys = redis.call('keys', 'tx:*:block')
+		for i, key in ipairs(txMappingKeys) do
+			local blockNum = tonumber(redis.call('get', key))
+			if blockNum >= tonumber(ARGV[1]) then
+				redis.call('del', key)
+			end
 		end
 
-		-- Find all log indices for the reorged block by topic
-		local topicLogKeys = redis.call('keys', 'topic:*')
-		for i, key in ipairs(topicLogKeys) do
-			redis.call('zremrangebyscore', key, ARGV[1], '+inf')
+		-- Find all receipt mappings for blocks >= reorgFromBlock
+		local receiptMappingKeys = redis.call('keys', 'receipt:*:block')
+		for i, key in ipairs(receiptMappingKeys) do
+			local blockNum = tonumber(redis.call('get', key))
+			if blockNum >= tonumber(ARGV[1]) then
+				redis.call('del', key)
+			end
 		end
 
-		-- Delete logs from block:hash:logs
-		local blockLogs = redis.call('smembers', ARGV[2])
-		for i, logIdx in ipairs(blockLogs) do
-			redis.call('del', 'log:' .. logIdx)
-			redis.call('del', 'log:' .. logIdx .. ':meta')
-		end
-
-		return #blockLogs
-	`, []string{}, fmt.Sprintf("%f", float64(reorgFromBlock)), fmt.Sprintf("block:%s:logs", oldHash))
+		return #txMappingKeys + #receiptMappingKeys
+	`, []string{}, fmt.Sprintf("%d", reorgFromBlock))
 
 	// Update current block if needed
 	rs.blockMutex.Lock()
