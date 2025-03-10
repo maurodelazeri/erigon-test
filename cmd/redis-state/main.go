@@ -43,10 +43,14 @@ import (
 	"github.com/erigontech/erigon-lib/common/math"
 	"github.com/erigontech/erigon-lib/log/v3"
 	"github.com/erigontech/erigon-lib/types/accounts"
+	"github.com/erigontech/erigon/consensus"
+	"github.com/erigontech/erigon/consensus/ethash"
+	"github.com/erigontech/erigon/consensus/ethash/ethashcfg"
 	"github.com/erigontech/erigon/core"
 	"github.com/erigontech/erigon/core/state"
 	"github.com/erigontech/erigon/core/types"
 	"github.com/erigontech/erigon/core/vm"
+	"github.com/erigontech/erigon/core/vm/evmtypes"
 	"github.com/erigontech/erigon/params"
 	"github.com/erigontech/erigon/rpc"
 )
@@ -704,7 +708,15 @@ func (r *PointInTimeRedisStateReader) ReadAccountDataForDebug(address libcommon.
 	return r.ReadAccountData(address)
 }
 
+// Custom types for tracing to avoid importing the tracing package
+type Tracer interface{}
+type AccountReadTrace struct{}
+type StorageReadTrace struct{}
+type CodeReadTrace struct{}
+
 // Implement additional methods required by state.StateReader interface
+func (r *PointInTimeRedisStateReader) SetTracer(_ Tracer) {}
+
 func (r *PointInTimeRedisStateReader) TraceAccountReads() bool {
 	return false
 }
@@ -715,6 +727,18 @@ func (r *PointInTimeRedisStateReader) TraceStorageReads() bool {
 
 func (r *PointInTimeRedisStateReader) TraceCodeReads() bool {
 	return false
+}
+
+func (r *PointInTimeRedisStateReader) ReadAccountTraces() []AccountReadTrace {
+	return nil
+}
+
+func (r *PointInTimeRedisStateReader) ReadStorageTraces() []StorageReadTrace {
+	return nil
+}
+
+func (r *PointInTimeRedisStateReader) ReadCodeTraces() []CodeReadTrace {
+	return nil
 }
 
 // GetDelegatedDesignation implements eip-7702 designation support
@@ -1097,8 +1121,15 @@ func (api *EthAPI) Call(ctx context.Context, args CallArgs, blockNumber string) 
 		return libcommon.HexToHash(blockData)
 	}
 
+	// Create a consensus engine (using consensus.EngineReader interface)
+	var consensusEngine consensus.EngineReader = ethash.New(ethashcfg.Config{
+		PowMode:       ethashcfg.ModeNormal,
+		CachesInMem:   3,
+		DatasetsInMem: 1,
+	}, nil, false)
+
 	// Create block context
-	blockContext := core.NewEVMBlockContext(header, getHashFn, nil, nil, chainConfig)
+	blockContext := core.NewEVMBlockContext(header, getHashFn, consensusEngine, nil, chainConfig)
 
 	// Handle BaseFee which might be present in the header
 	var baseFee *uint256.Int
@@ -1122,8 +1153,8 @@ func (api *EthAPI) Call(ctx context.Context, args CallArgs, blockNumber string) 
 	// Create EVM configuration
 	vmConfig := vm.Config{NoBaseFee: true}
 
-	// Create EVM
-	evm := vm.NewEVM(blockContext, txContext, stateDB, chainConfig, vmConfig)
+	// Create EVM - using evmtypes for block and tx context
+	evm := vm.NewEVM(evmtypes.BlockContext(blockContext), evmtypes.TxContext(txContext), stateDB, chainConfig, vmConfig)
 
 	// Handle timeout
 	go func() {
