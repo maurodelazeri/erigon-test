@@ -88,13 +88,10 @@ This implementation stores data in Redis using the following key patterns:
 2. **Transactions**
    - `txs:{blockNum}` - Hash where keys are tx indices and values are RLP-encoded transactions
    - `block:{blockNum}:txs` - Set of transaction hashes in the block
-   - `tx:{txHash}:block` - Transaction hash to block number mapping
-   - `sender:{address}:txs` - Sorted set of transactions sent by an address with block numbers as scores
 
 3. **Receipts**
    - `receipts:{blockNum}` - Hash where keys are tx indices and values are RLP-encoded receipts
    - `block:{blockNum}:receipts` - Sorted set of transaction hashes with indices as scores
-   - `receipt:{txHash}:block` - Transaction hash to block number mapping
 
 4. **Accounts**
    - `account:{address}` - Sorted set with block numbers as scores and account data as values
@@ -146,16 +143,6 @@ HGETALL txs:{blockNum}
 HGETALL receipts:{blockNum}
 ```
 
-### Getting Transaction Hash to Block Mapping
-```
-GET tx:{txHash}:block
-```
-
-### Getting Receipt Hash to Block Mapping
-```
-GET receipt:{txHash}:block
-```
-
 ### Getting Account State at a Block
 ```
 ZREVRANGEBYSCORE account:{address} {blockNum} 0 LIMIT 0 1 WITHSCORES
@@ -164,11 +151,6 @@ ZREVRANGEBYSCORE account:{address} {blockNum} 0 LIMIT 0 1 WITHSCORES
 ### Getting Storage Value at a Block
 ```
 ZREVRANGEBYSCORE storage:{address}:{slot} {blockNum} 0 LIMIT 0 1 WITHSCORES
-```
-
-### Getting Transactions by Sender
-```
-ZRANGE sender:{address}:txs {startIndex} {endIndex} WITHSCORES
 ```
 
 ### Getting Contract Code
@@ -347,18 +329,20 @@ The following files were modified to implement the Redis state integration:
 ### Key Changes
 
 1. **Transaction Storage**
-   - Before: Transactions were stored as `tx:{txHash}` with metadata in `tx:{txHash}:meta`
-   - After: Transactions are stored as entries in `txs:{blockNum}` hash with `tx:{txHash}:block` mapping
+   - Transactions are stored as entries in `txs:{blockNum}` hash
+   - Transaction lookup is only available by block number and index
+   - Removed `tx:{txHash}:block` and `sender:{address}:txs` mappings
 
 2. **Receipt Storage**
-   - Before: Receipts were stored as `receipt:{txHash}` with metadata in `receipt:{txHash}:meta`
-   - After: Receipts are stored as entries in `receipts:{blockNum}` hash with `receipt:{txHash}:block` mapping
+   - Receipts are stored as entries in `receipts:{blockNum}` hash
+   - Receipt lookup is only available by block number and index
+   - Removed `receipt:{txHash}:block` mapping
 
 3. **Log Storage**
-   - Before: Logs were stored separately with their own indices
-   - After: Logs are not stored separately (they can be retrieved from receipts if needed)
+   - Logs are not stored separately (they can be retrieved from receipts if needed)
 
 4. **Data Access**
    - All historical queries remain O(1) complexity
    - Block-based queries are now more efficient
-   - Reduced storage requirements by eliminating separate log storage
+   - Reduced storage requirements by eliminating transaction hash and sender mappings
+   - Reduced storage requirements by eliminating receipt hash mappings

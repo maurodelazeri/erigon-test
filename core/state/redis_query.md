@@ -118,16 +118,6 @@ Erigon uses Redis to shadow blockchain data using consistent key patterns and ap
   ...
   ```
 
-### Transaction Hash to Block Mapping
-
-- **Key Pattern**: `tx:{txHash}:block`
-- **Data Structure**: String
-- **Value**: Block number
-- **Example**:
-  ```
-  > GET tx:0x5315704d3d739427b17da289510ca7d52f20644d48646f2a9f6b6f50bca254d5:block
-  22013269
-  ```
 
 ### Block's Transaction Hashes
 
@@ -158,16 +148,6 @@ Erigon uses Redis to shadow blockchain data using consistent key patterns and ap
   ...
   ```
 
-### Receipt Hash to Block Mapping
-
-- **Key Pattern**: `receipt:{txHash}:block`
-- **Data Structure**: String
-- **Value**: Block number
-- **Example**:
-  ```
-  > GET receipt:0x5315704d3d739427b17da289510ca7d52f20644d48646f2a9f6b6f50bca254d5:block
-  22013269
-  ```
 
 ### Block's Receipt Indices
 
@@ -185,18 +165,6 @@ Erigon uses Redis to shadow blockchain data using consistent key patterns and ap
   [...]
   ```
 
-### Sender Transactions
-
-- **Key Pattern**: `sender:{address}:txs`
-- **Data Structure**: Sorted Set (ZSET)
-- **Score**: Block number
-- **Member**: Transaction hash
-- **Example**:
-  ```
-  > ZRANGE sender:0xE96dA1d4D34420Dec3eF41f0C4264B172B0666DC:txs 0 -1 WITHSCORES
-  0x9351b234c3cec171780f9cef3bbbd84940038f5f918737827f8a3ee98e6987c2
-  22013282
-  ```
 
 ## Query Patterns
 
@@ -264,29 +232,7 @@ Example:
 > HGETALL receipts:22013269
 ```
 
-### Finding a Transaction's Block
 
-```
-GET tx:{txHash}:block
-```
-
-Example:
-
-```
-> GET tx:0x5315704d3d739427b17da289510ca7d52f20644d48646f2a9f6b6f50bca254d5:block
-```
-
-### Getting Transactions by Sender
-
-```
-ZRANGE sender:{address}:txs {startIndex} {endIndex} WITHSCORES
-```
-
-Example:
-
-```
-> ZRANGE sender:0xE96dA1d4D34420Dec3eF41f0C4264B172B0666DC:txs 0 -1 WITHSCORES
-```
 
 ### Getting Contract Code
 
@@ -349,11 +295,6 @@ HGETALL txs:{blockNum}
 HGETALL receipts:{blockNum}
 ```
 
-**Find a transaction's block**
-
-```
-GET tx:{txHash}:block
-```
 
 ### 2. Account/Contract Analysis
 
@@ -369,11 +310,6 @@ ZRANGE account:{address} 0 -1 WITHSCORES
 ZRANGE storage:{address}:{storageKey} 0 -1 WITHSCORES
 ```
 
-**Get all transactions sent by an address**
-
-```
-ZRANGE sender:{address}:txs 0 -1 WITHSCORES
-```
 
 **Get contract code**
 

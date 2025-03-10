@@ -323,9 +323,8 @@ func (rs *RedisState) writeTx(blockNum uint64, blockHash libcommon.Hash, tx type
 		return
 	}
 
-	// Get tx hash and sender
+	// Get tx hash
 	txHash := tx.Hash()
-	sender, ok := tx.GetSender()
 
 	rs.pipelineMutex.Lock()
 	defer rs.pipelineMutex.Unlock()
@@ -343,18 +342,6 @@ func (rs *RedisState) writeTx(blockNum uint64, blockHash libcommon.Hash, tx type
 
 	// Add transaction hash to block's transaction list for reference
 	rs.pipeline.SAdd(rs.ctx, fmt.Sprintf("block:%d:txs", blockNum), txHash.Hex())
-
-	// Map transaction hash to block number for lookups
-	txBlockKey := fmt.Sprintf("tx:%s:block", txHash.Hex())
-	rs.pipeline.Set(rs.ctx, txBlockKey, blockNum, 0)
-
-	// Store sender index if available
-	if ok {
-		rs.pipeline.ZAdd(rs.ctx, fmt.Sprintf("sender:%s:txs", sender.Hex()), redis.Z{
-			Score:  float64(blockNum),
-			Member: txHash.Hex(),
-		})
-	}
 }
 
 // writeReceipt writes receipt data to Redis
@@ -376,10 +363,6 @@ func (rs *RedisState) writeReceipt(blockNum uint64, blockHash libcommon.Hash, re
 	// Store receipt directly in block-indexed hash
 	blockReceiptsKey := fmt.Sprintf("receipts:%d", blockNum)
 	rs.pipeline.HSet(rs.ctx, blockReceiptsKey, fmt.Sprintf("%d", receipt.TransactionIndex), string(receiptData))
-
-	// Map receipt hash to block number for lookups
-	receiptBlockKey := fmt.Sprintf("receipt:%s:block", receipt.TxHash.Hex())
-	rs.pipeline.Set(rs.ctx, receiptBlockKey, blockNum, 0)
 
 	// Add to block's receipts list (maintain reference by tx hash)
 	rs.pipeline.ZAdd(rs.ctx, fmt.Sprintf("block:%d:receipts", blockNum), redis.Z{
@@ -455,29 +438,6 @@ func (rs *RedisState) handleReorg(reorgFromBlock uint64, newCanonicalHash libcom
 		end
 		return #keys
 	`, []string{}, fmt.Sprintf("%f", float64(reorgFromBlock)))
-
-	// 3. Delete all tx and receipt mappings
-	rs.pipeline.Eval(rs.ctx, `
-		-- Find all tx mappings for blocks >= reorgFromBlock
-		local txMappingKeys = redis.call('keys', 'tx:*:block')
-		for i, key in ipairs(txMappingKeys) do
-			local blockNum = tonumber(redis.call('get', key))
-			if blockNum >= tonumber(ARGV[1]) then
-				redis.call('del', key)
-			end
-		end
-
-		-- Find all receipt mappings for blocks >= reorgFromBlock
-		local receiptMappingKeys = redis.call('keys', 'receipt:*:block')
-		for i, key in ipairs(receiptMappingKeys) do
-			local blockNum = tonumber(redis.call('get', key))
-			if blockNum >= tonumber(ARGV[1]) then
-				redis.call('del', key)
-			end
-		end
-
-		return #txMappingKeys + #receiptMappingKeys
-	`, []string{}, fmt.Sprintf("%d", reorgFromBlock))
 
 	// Update current block if needed
 	rs.blockMutex.Lock()
