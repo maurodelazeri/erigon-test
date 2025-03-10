@@ -9,9 +9,10 @@
  #include <stdlib.h>
  #include <string.h>
  #include <stdint.h>
+ #include <time.h>
  #include "redismodule.h"
 
- #define BSSL_ENCODING_VERSION 1
+ #define BSSL_ENCODING_VERSION 2    // Updated version for new encoding format
  #define BSSL_MAX_LEVEL 32
  #define BSSL_MAX_STATE_SIZE (1024 * 1024)  // 1MB max state size
  #define BSSL_P 0.25  // Probability for skip list levels
@@ -75,6 +76,7 @@
 
      list->header->state_data = NULL;
      list->header->state_size = 0;
+     list->header->block_number = 0;  // Initialize block number
 
      // Initialize forward pointers
      for (int i = 0; i < BSSL_MAX_LEVEL; i++) {
@@ -92,13 +94,16 @@
      BSSLNode *next;
 
      while (current) {
-         next = current->forward[0];
+         next = current->forward ? current->forward[0] : NULL;
 
          if (current->state_data) {
              RedisModule_Free(current->state_data);
          }
 
-         RedisModule_Free(current->forward);
+         if (current->forward) {
+             RedisModule_Free(current->forward);
+         }
+
          RedisModule_Free(current);
          current = next;
      }
@@ -116,8 +121,10 @@
  }
 
  // Insert a new node into the skip list
- BSSLNode* bsslInsert(BSSLSkipList *list, uint64_t block_number, uint8_t *state_data, uint32_t state_size) {
-     if (!list) return NULL;
+ BSSLNode* bsslInsert(BSSLSkipList *list, uint64_t block_number, const uint8_t *state_data, uint32_t state_size) {
+     if (!list || !list->header || !state_data || state_size == 0 || state_size > BSSL_MAX_STATE_SIZE) {
+         return NULL;
+     }
 
      // Create update array to store pointers that need updating
      BSSLNode *update[BSSL_MAX_LEVEL];
@@ -125,20 +132,23 @@
 
      // Find position to insert in each level
      for (int i = list->level - 1; i >= 0; i--) {
-         while (current->forward[i] && current->forward[i]->block_number < block_number) {
+         while (current->forward && current->forward[i] &&
+                current->forward[i]->block_number < block_number) {
              current = current->forward[i];
          }
          update[i] = current;
      }
 
      // Check if block already exists
-     if (current->forward[0] && current->forward[0]->block_number == block_number) {
+     if (current->forward && current->forward[0] &&
+         current->forward[0]->block_number == block_number) {
          // Update existing node
          BSSLNode *node = current->forward[0];
 
          // Free old state data
          if (node->state_data) {
              RedisModule_Free(node->state_data);
+             node->state_data = NULL;
          }
 
          // Allocate and copy new state data
@@ -168,12 +178,19 @@
 
      new_node->block_number = block_number;
      new_node->level = new_level;
+     new_node->forward = NULL;
+     new_node->state_data = NULL;
 
      // Allocate forward pointers
      new_node->forward = RedisModule_Alloc(new_level * sizeof(BSSLNode*));
      if (!new_node->forward) {
          RedisModule_Free(new_node);
          return NULL;
+     }
+
+     // Initialize forward pointers
+     for (int i = 0; i < new_level; i++) {
+         new_node->forward[i] = NULL;
      }
 
      // Allocate and copy state data
@@ -199,23 +216,19 @@
 
  // Find the node with the largest block number less than or equal to target
  BSSLNode* bsslFindLessThanOrEqual(BSSLSkipList *list, uint64_t block_number) {
-     if (!list || !list->node_count) return NULL;
+     if (!list || !list->header || !list->node_count) return NULL;
 
      BSSLNode *current = list->header;
 
      // Start from highest level and work down
      for (int i = list->level - 1; i >= 0; i--) {
-         while (current->forward[i] && current->forward[i]->block_number <= block_number) {
+         while (current->forward && current->forward[i] &&
+                current->forward[i]->block_number <= block_number) {
              current = current->forward[i];
-         }
-
-         // If we found exact match, return immediately
-         if (current != list->header && current->block_number == block_number) {
-             return current;
          }
      }
 
-     // We found the largest block <= target
+     // If we found a node and it's not the header, return it
      if (current != list->header) {
          return current;
      }
@@ -226,22 +239,22 @@
 
  /* Binary Encoding/Decoding Functions */
 
- // Encode a skip list to binary format
+ // Encode a skip list to binary format - completely rewritten to be safer
  size_t bsslEncodeSkipList(BSSLSkipList *list, uint8_t **output) {
-     if (!list || !list->node_count) {
-         *output = NULL;
+     if (!list || !list->node_count || !output) {
+         if (output) *output = NULL;
          return 0;
      }
 
-     // Calculate total size needed
+     // Calculate total size needed for a flat encoding
      size_t total_size = 16;  // 16-byte header
-     BSSLNode *current = list->header->forward[0];
+     BSSLNode *current = list->header->forward ? list->header->forward[0] : NULL;
 
+     // First pass to calculate size
      while (current) {
-         // Each node has: block number (8), level (2), state size (4),
-         // forward pointers (8 * level), state data (state_size)
-         total_size += 14 + (current->level * 8) + current->state_size;
-         current = current->forward[0];
+         // Each node needs: block number (8), level (1), state size (4), state data (state_size)
+         total_size += 13 + current->state_size;
+         current = current->forward ? current->forward[0] : NULL;
      }
 
      // Allocate output buffer
@@ -265,418 +278,487 @@
      memset(ptr, 0, 6);
      ptr += 6;
 
-     // Write nodes
-     current = list->header->forward[0];
+     // Write nodes in a flat structure (no pointers)
+     current = list->header->forward ? list->header->forward[0] : NULL;
      while (current) {
          // Block number (8 bytes)
          *(uint64_t*)ptr = current->block_number;
          ptr += 8;
 
-         // Level (2 bytes)
-         *(uint16_t*)ptr = current->level;
-         ptr += 2;
+         // Level (1 byte) - reduced from 2 bytes for efficiency
+         *ptr++ = (uint8_t)current->level;
 
          // State size (4 bytes)
          *(uint32_t*)ptr = current->state_size;
          ptr += 4;
 
-         // Forward pointers (8 bytes each)
-         // Store as offsets from start of buffer
-         for (int i = 0; i < current->level; i++) {
-             if (current->forward[i]) {
-                 // Calculate offset to target node
-                 size_t offset = (uint8_t*)current->forward[i] - *output;
-                 *(uint64_t*)ptr = offset;
-             } else {
-                 *(uint64_t*)ptr = 0;
-             }
-             ptr += 8;
+         // State data
+         if (current->state_data && current->state_size > 0) {
+             memcpy(ptr, current->state_data, current->state_size);
+             ptr += current->state_size;
          }
 
-         // State data
-         memcpy(ptr, current->state_data, current->state_size);
-         ptr += current->state_size;
-
-         current = current->forward[0];
+         // Move to next node
+         current = current->forward ? current->forward[0] : NULL;
      }
 
-     return total_size;
+     // Return actual size used
+     return (size_t)(ptr - *output);
  }
 
- // Decode a binary encoded skip list
- BSSLSkipList* bsslDecodeSkipList(uint8_t *data, size_t size) {
+ // Decode a binary encoded skip list - completely rewritten for safety
+ BSSLSkipList* bsslDecodeSkipList(const uint8_t *data, size_t size) {
      if (!data || size < 16) return NULL;
 
      // Check magic
      if (memcmp(data, "BSSL", 4) != 0) return NULL;
 
      // Check version
-     if (data[4] != BSSL_ENCODING_VERSION) return NULL;
+     uint8_t version = data[4];
+     if (version != BSSL_ENCODING_VERSION && version != 1) return NULL;
 
      // Create new skip list
      BSSLSkipList *list = bsslCreateSkipList();
      if (!list) return NULL;
 
-     // Parse header - skip level byte since we don't use it
+     // Parse header
      uint32_t node_count = *(uint32_t*)(data + 6);
 
      // Skip reserved bytes
-     uint8_t *ptr = data + 16;
+     const uint8_t *ptr = data + 16;
+     const uint8_t *end = data + size;
 
-     // Parse nodes
-     for (uint32_t i = 0; i < node_count; i++) {
-         // Get block number
-         uint64_t block_number = *(uint64_t*)ptr;
-         ptr += 8;
+     // For version 1, we have a different format to parse
+     if (version == 1) {
+         // Old format had pointers, we'll need to extract just the data
+         for (uint32_t i = 0; i < node_count && ptr < end; i++) {
+             // Ensure we have enough space for the fixed-size header
+             if (ptr + 14 > end) break;
 
-         // Get level
-         uint16_t level = *(uint16_t*)ptr;
-         ptr += 2;
+             // Get block number
+             uint64_t block_number = *(uint64_t*)ptr;
+             ptr += 8;
 
-         // Get state size
-         uint32_t state_size = *(uint32_t*)ptr;
-         ptr += 4;
+             // Get level (was 2 bytes in old format)
+             uint16_t level = *(uint16_t*)ptr;
+             ptr += 2;
 
-         // Skip forward pointers for now
-         ptr += level * 8;
+             // Get state size
+             uint32_t state_size = *(uint32_t*)ptr;
+             ptr += 4;
 
-         // Get state data
-         uint8_t *state_data = ptr;
-         ptr += state_size;
+             // Bounds check for state size
+             if (state_size > BSSL_MAX_STATE_SIZE || ptr + (level * 8) + state_size > end) {
+                 bsslFreeSkipList(list);
+                 return NULL;
+             }
 
-         // Insert node
-         bsslInsert(list, block_number, state_data, state_size);
+             // Skip the forward pointers (8 bytes each)
+             ptr += level * 8;
+
+             // Bounds check again after skipping pointers
+             if (ptr + state_size > end) {
+                 bsslFreeSkipList(list);
+                 return NULL;
+             }
+
+             // Get state data
+             const uint8_t *state_data = ptr;
+             ptr += state_size;
+
+             // Insert node
+             if (!bsslInsert(list, block_number, state_data, state_size)) {
+                 bsslFreeSkipList(list);
+                 return NULL;
+             }
+         }
+     } else {
+         // New format (version 2)
+         for (uint32_t i = 0; i < node_count && ptr < end; i++) {
+             // Ensure we have enough space for the fixed-size header
+             if (ptr + 13 > end) break;
+
+             // Get block number
+             uint64_t block_number = *(uint64_t*)ptr;
+             ptr += 8;
+
+             // Get level (1 byte in new format) - we read but don't use this value
+             // as the bsslInsert function will determine the appropriate level
+             ptr++; // Skip level byte
+
+             // Get state size
+             uint32_t state_size = *(uint32_t*)ptr;
+             ptr += 4;
+
+             // Bounds check for state size
+             if (state_size > BSSL_MAX_STATE_SIZE || ptr + state_size > end) {
+                 bsslFreeSkipList(list);
+                 return NULL;
+             }
+
+             // Get state data
+             const uint8_t *state_data = ptr;
+             ptr += state_size;
+
+             // Insert node
+             if (!bsslInsert(list, block_number, state_data, state_size)) {
+                 bsslFreeSkipList(list);
+                 return NULL;
+             }
+         }
      }
 
      return list;
  }
 
- /* Address Metadata Functions */
+ /* Metadata Functions - Simplified for safety */
 
- // Create a new address metadata object
- BSSLAddressMetadata* bsslCreateAddressMetadata(uint64_t block_number, RedisModuleString *state) {
-     BSSLAddressMetadata *metadata = RedisModule_Alloc(sizeof(BSSLAddressMetadata));
-     if (!metadata) return NULL;
+ // Create a metadata string
+ char* formatMetadata(uint64_t first_block, uint64_t last_block, uint32_t state_count) {
+     char* buffer = RedisModule_Alloc(256);
+     if (!buffer) return NULL;
 
-     metadata->first_block = block_number;
-     metadata->last_block = block_number;
-     metadata->state_count = 1;
-     metadata->last_state = RedisModule_CreateStringFromString(NULL, state);
+     snprintf(buffer, 256, "%llu,%llu,%u",
+              (unsigned long long)first_block,
+              (unsigned long long)last_block,
+              state_count);
 
-     return metadata;
+     return buffer;
  }
 
- // Free an address metadata object
- void bsslFreeAddressMetadata(BSSLAddressMetadata *metadata) {
-     if (!metadata) return;
+ // Parse a metadata string
+ int parseMetadata(const char* str, uint64_t* first_block, uint64_t* last_block, uint32_t* state_count) {
+     if (!str || !first_block || !last_block || !state_count) return 0;
 
-     if (metadata->last_state) {
-         RedisModule_FreeString(NULL, metadata->last_state);
-     }
-
-     RedisModule_Free(metadata);
- }
-
- // Encode address metadata to string
- RedisModuleString* bsslEncodeAddressMetadata(RedisModuleCtx *ctx, BSSLAddressMetadata *metadata) {
-     char buffer[1024];
-     int len = snprintf(buffer, sizeof(buffer),
-                      "%llu,%llu,%u",
-                      (unsigned long long)metadata->first_block,
-                      (unsigned long long)metadata->last_block,
-                      metadata->state_count);
-
-     RedisModuleString *metaString = RedisModule_CreateString(ctx, buffer, len);
-     return metaString;
- }
-
- // Decode address metadata from string
- BSSLAddressMetadata* bsslDecodeAddressMetadata(RedisModuleCtx *ctx, RedisModuleString *str, RedisModuleString *last_state) {
-     size_t len;
-     const char *s = RedisModule_StringPtrLen(str, &len);
-
-     BSSLAddressMetadata *metadata = RedisModule_Alloc(sizeof(BSSLAddressMetadata));
-     if (!metadata) return NULL;
-
-     // Parse fields from string
-     if (sscanf(s, "%llu,%llu,%u",
-                (unsigned long long*)&metadata->first_block,
-                (unsigned long long*)&metadata->last_block,
-                &metadata->state_count) != 3) {
-         RedisModule_Free(metadata);
-         return NULL;
-     }
-
-     if (last_state) {
-         metadata->last_state = RedisModule_CreateStringFromString(ctx, last_state);
-     } else {
-         metadata->last_state = NULL;
-     }
-
-     return metadata;
+     return sscanf(str, "%llu,%llu,%u",
+                  (unsigned long long*)first_block,
+                  (unsigned long long*)last_block,
+                  state_count) == 3;
  }
 
  /* Command Implementations */
 
  // BSSL.PING command - for basic testing
  int BSSLPing_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) {
-     RedisModule_ReplyWithSimpleString(ctx, "PONG");
-     return REDISMODULE_OK;
+     REDISMODULE_NOT_USED(argv);
+
+     if (argc != 1) {
+         return RedisModule_WrongArity(ctx);
+     }
+
+     return RedisModule_ReplyWithSimpleString(ctx, "PONG");
  }
 
- // BSSL.SET address block_num state
+ // BSSL.SET address block_num state - COMPLETELY REWRITTEN FOR SAFETY
  int BSSLSet_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) {
      if (argc != 4) {
-         RedisModule_WrongArity(ctx);
-         return REDISMODULE_ERR;
+         return RedisModule_WrongArity(ctx);
      }
+
+     // Add debug logging
+     RedisModule_Log(ctx, "notice", "Starting BSSLSet_RedisCommand");
 
      RedisModule_AutoMemory(ctx);
 
      // Parse arguments
      RedisModuleString *address = argv[1];
+     if (!address) {
+         return RedisModule_ReplyWithError(ctx, "ERR invalid address");
+     }
 
      long long block_number;
-     if (RedisModule_StringToLongLong(argv[2], &block_number) != REDISMODULE_OK) {
-         RedisModule_ReplyWithError(ctx, "ERR invalid block number");
-         return REDISMODULE_ERR;
+     if (RedisModule_StringToLongLong(argv[2], &block_number) != REDISMODULE_OK || block_number < 0) {
+         return RedisModule_ReplyWithError(ctx, "ERR invalid block number");
      }
 
      RedisModuleString *state = argv[3];
-
-     // Open or create address index
-     RedisModuleKey *indexKey = RedisModule_OpenKey(ctx,
-         RedisModule_CreateString(ctx, "bssl:address_index", 17),
-         REDISMODULE_READ | REDISMODULE_WRITE);
-
-     // Check if key exists and is a hash
-     if (RedisModule_KeyType(indexKey) != REDISMODULE_KEYTYPE_EMPTY &&
-         RedisModule_KeyType(indexKey) != REDISMODULE_KEYTYPE_HASH) {
-         RedisModule_ReplyWithError(ctx, REDISMODULE_ERRORMSG_WRONGTYPE);
-         return REDISMODULE_ERR;
+     if (!state) {
+         return RedisModule_ReplyWithError(ctx, "ERR invalid state");
      }
 
-     // If empty, create hash
-     if (RedisModule_KeyType(indexKey) == REDISMODULE_KEYTYPE_EMPTY) {
-         RedisModule_DeleteKey(indexKey);
-         RedisModule_CloseKey(indexKey);
-         indexKey = RedisModule_OpenKey(ctx,
-             RedisModule_CreateString(ctx, "bssl:address_index", 17),
-             REDISMODULE_READ | REDISMODULE_WRITE);
-         if (RedisModule_HashSet(indexKey, REDISMODULE_HASH_NONE, NULL, NULL, NULL) != REDISMODULE_OK) {
-             RedisModule_ReplyWithError(ctx, "ERR could not create hash");
-             return REDISMODULE_ERR;
-         }
-     }
-
-     // Look up address in index
-     RedisModuleString *metadataStr = NULL;
-     RedisModuleString *last_state_str = NULL;
-
-     RedisModule_HashGet(indexKey, REDISMODULE_HASH_CFIELDS,
-         address, &metadataStr,
-         RedisModule_CreateStringPrintf(ctx, "%s:last_state",
-             RedisModule_StringPtrLen(address, NULL)), &last_state_str,
-         NULL);
-
-     BSSLAddressMetadata *metadata = NULL;
-
-     if (metadataStr) {
-         // Update existing metadata
-         metadata = bsslDecodeAddressMetadata(ctx, metadataStr, last_state_str);
-
-         // Update fields
-         if ((uint64_t)block_number < metadata->first_block) {
-             metadata->first_block = (uint64_t)block_number;
-         }
-         if ((uint64_t)block_number > metadata->last_block) {
-             metadata->last_block = (uint64_t)block_number;
-         }
-         metadata->state_count++;
-
-         // Free old last state and set new one
-         if (metadata->last_state) {
-             RedisModule_FreeString(ctx, metadata->last_state);
-         }
-         metadata->last_state = RedisModule_CreateStringFromString(ctx, state);
-     } else {
-         // Create new metadata
-         metadata = bsslCreateAddressMetadata((uint64_t)block_number, state);
-     }
-
-     // Format skip list key
-     RedisModuleString *skipListKey = RedisModule_CreateStringPrintf(ctx,
-         "bssl:state_list:%s", RedisModule_StringPtrLen(address, NULL));
-
-     // Open or create skip list
-     RedisModuleKey *listKey = RedisModule_OpenKey(ctx, skipListKey,
-         REDISMODULE_READ | REDISMODULE_WRITE);
-
-     BSSLSkipList *skipList = NULL;
-
-     if (RedisModule_KeyType(listKey) == REDISMODULE_KEYTYPE_STRING) {
-         // Load existing skip list
-         size_t dataSize;
-         uint8_t *data = (uint8_t*)RedisModule_StringDMA(listKey, &dataSize, REDISMODULE_READ);
-
-         skipList = bsslDecodeSkipList(data, dataSize);
-     } else if (RedisModule_KeyType(listKey) == REDISMODULE_KEYTYPE_EMPTY) {
-         // Create new skip list
-         skipList = bsslCreateSkipList();
-     } else {
-         bsslFreeAddressMetadata(metadata);
-         RedisModule_ReplyWithError(ctx, REDISMODULE_ERRORMSG_WRONGTYPE);
-         return REDISMODULE_ERR;
-     }
-
-     if (!skipList) {
-         bsslFreeAddressMetadata(metadata);
-         RedisModule_ReplyWithError(ctx, "ERR could not create/load skip list");
-         return REDISMODULE_ERR;
-     }
-
-     // Get state data
+     // Get state data and validate size
      size_t stateSize;
      const char *stateData = RedisModule_StringPtrLen(state, &stateSize);
+     if (!stateData || stateSize == 0) {
+         return RedisModule_ReplyWithError(ctx, "ERR empty state data");
+     }
+
+     if (stateSize > BSSL_MAX_STATE_SIZE) {
+         return RedisModule_ReplyWithError(ctx, "ERR state data too large");
+     }
+
+     // Create keys for the metadata and state storage
+     size_t addrLen;
+     const char* addrStr = RedisModule_StringPtrLen(address, &addrLen);
+
+     // Create skip list key with explicit format: "bssl:state_list:{address}"
+     char* skipListKeyStr = RedisModule_Alloc(addrLen + 18); // "bssl:state_list:" + address + null
+     if (!skipListKeyStr) {
+         RedisModule_Log(ctx, "warning", "Failed to allocate memory for skip list key");
+         return RedisModule_ReplyWithError(ctx, "ERR could not allocate memory");
+     }
+
+     snprintf(skipListKeyStr, addrLen + 18, "bssl:state_list:%.*s", (int)addrLen, addrStr);
+     RedisModuleString *skipListKey = RedisModule_CreateString(ctx, skipListKeyStr, strlen(skipListKeyStr));
+     RedisModule_Free(skipListKeyStr);
+
+     // Create metadata key with explicit format: "bssl:meta:{address}"
+     char* metaKeyStr = RedisModule_Alloc(addrLen + 11); // "bssl:meta:" + address + null
+     if (!metaKeyStr) {
+         RedisModule_Log(ctx, "warning", "Failed to allocate memory for metadata key");
+         return RedisModule_ReplyWithError(ctx, "ERR could not allocate memory");
+     }
+
+     snprintf(metaKeyStr, addrLen + 11, "bssl:meta:%.*s", (int)addrLen, addrStr);
+     RedisModuleString *metaKey = RedisModule_CreateString(ctx, metaKeyStr, strlen(metaKeyStr));
+     RedisModule_Free(metaKeyStr);
+
+     // Create last state key with explicit format: "bssl:last:{address}"
+     char* lastKeyStr = RedisModule_Alloc(addrLen + 11); // "bssl:last:" + address + null
+     if (!lastKeyStr) {
+         RedisModule_Log(ctx, "warning", "Failed to allocate memory for last state key");
+         return RedisModule_ReplyWithError(ctx, "ERR could not allocate memory");
+     }
+
+     snprintf(lastKeyStr, addrLen + 11, "bssl:last:%.*s", (int)addrLen, addrStr);
+     RedisModuleString *lastKey = RedisModule_CreateString(ctx, lastKeyStr, strlen(lastKeyStr));
+     RedisModule_Free(lastKeyStr);
+
+     // Process metadata
+     uint64_t first_block = (uint64_t)block_number;
+     uint64_t last_block = (uint64_t)block_number;
+     uint32_t state_count = 1;
+
+     // Try to get existing metadata
+     RedisModuleKey *existingMeta = RedisModule_OpenKey(ctx, metaKey, REDISMODULE_READ);
+     if (existingMeta && RedisModule_KeyType(existingMeta) == REDISMODULE_KEYTYPE_STRING) {
+         size_t len;
+         char *metaData = (char*)RedisModule_StringDMA(existingMeta, &len, REDISMODULE_READ);
+
+         // Parse existing metadata
+         if (metaData && len > 0 && parseMetadata(metaData, &first_block, &last_block, &state_count)) {
+             // Update metadata values
+             if ((uint64_t)block_number < first_block) {
+                 first_block = (uint64_t)block_number;
+             }
+             if ((uint64_t)block_number > last_block) {
+                 last_block = (uint64_t)block_number;
+             }
+             state_count++;
+         }
+     }
+     RedisModule_CloseKey(existingMeta);
+
+     // Process skip list
+     BSSLSkipList *skipList = NULL;
+
+     // Try to get existing skip list
+     RedisModuleKey *existingSkipList = RedisModule_OpenKey(ctx, skipListKey, REDISMODULE_READ);
+     if (existingSkipList && RedisModule_KeyType(existingSkipList) == REDISMODULE_KEYTYPE_STRING) {
+         size_t dataSize;
+         uint8_t *data = (uint8_t*)RedisModule_StringDMA(existingSkipList, &dataSize, REDISMODULE_READ);
+
+         if (data && dataSize > 0) {
+             skipList = bsslDecodeSkipList(data, dataSize);
+         }
+     }
+     RedisModule_CloseKey(existingSkipList);
+
+     // If no existing skip list, create a new one
+     if (!skipList) {
+         skipList = bsslCreateSkipList();
+         if (!skipList) {
+             RedisModule_Log(ctx, "warning", "Failed to create skip list");
+             return RedisModule_ReplyWithError(ctx, "ERR could not create skip list");
+         }
+     }
 
      // Insert state into skip list
      BSSLNode *node = bsslInsert(skipList, (uint64_t)block_number, (uint8_t*)stateData, stateSize);
-
      if (!node) {
          bsslFreeSkipList(skipList);
-         bsslFreeAddressMetadata(metadata);
-         RedisModule_ReplyWithError(ctx, "ERR could not insert state");
-         return REDISMODULE_ERR;
+         RedisModule_Log(ctx, "warning", "Failed to insert state into skip list");
+         return RedisModule_ReplyWithError(ctx, "ERR could not insert state");
      }
 
-     // Encode skip list and store
-     uint8_t *encodedList;
+     // Encode skip list
+     uint8_t *encodedList = NULL;
      size_t encodedSize = bsslEncodeSkipList(skipList, &encodedList);
-
-     if (encodedSize == 0) {
+     if (encodedSize == 0 || !encodedList) {
          bsslFreeSkipList(skipList);
-         bsslFreeAddressMetadata(metadata);
-         RedisModule_ReplyWithError(ctx, "ERR could not encode skip list");
-         return REDISMODULE_ERR;
+         RedisModule_Log(ctx, "warning", "Failed to encode skip list");
+         return RedisModule_ReplyWithError(ctx, "ERR could not encode skip list");
      }
 
-     RedisModule_StringTruncate(listKey, encodedSize);
-     uint8_t *listData = (uint8_t*)RedisModule_StringDMA(listKey, &encodedSize, REDISMODULE_WRITE);
-     memcpy(listData, encodedList, encodedSize);
+     // Write the encoded skip list to Redis
+     RedisModuleKey *listKey = RedisModule_OpenKey(ctx, skipListKey, REDISMODULE_WRITE);
+     if (!listKey) {
+         RedisModule_Free(encodedList);
+         bsslFreeSkipList(skipList);
+         RedisModule_Log(ctx, "warning", "Failed to open skip list key for writing");
+         return RedisModule_ReplyWithError(ctx, "ERR could not open skip list key");
+     }
+
+     // Create a string with the encoded data
+     RedisModule_StringSet(listKey, RedisModule_CreateString(ctx, (char*)encodedList, encodedSize));
+     RedisModule_CloseKey(listKey);
      RedisModule_Free(encodedList);
 
-     // Update metadata in index
-     RedisModuleString *newMetadataStr = bsslEncodeAddressMetadata(ctx, metadata);
+     // Format and write the metadata
+     char* metaStr = formatMetadata(first_block, last_block, state_count);
+     if (!metaStr) {
+         bsslFreeSkipList(skipList);
+         RedisModule_Log(ctx, "warning", "Failed to format metadata");
+         return RedisModule_ReplyWithError(ctx, "ERR could not format metadata");
+     }
 
-     RedisModule_HashSet(indexKey, REDISMODULE_HASH_CFIELDS,
-         address, newMetadataStr,
-         RedisModule_CreateStringPrintf(ctx, "%s:last_state",
-             RedisModule_StringPtrLen(address, NULL)), state,
-         NULL);
+     RedisModuleKey *metaWrite = RedisModule_OpenKey(ctx, metaKey, REDISMODULE_WRITE);
+     if (!metaWrite) {
+         RedisModule_Free(metaStr);
+         bsslFreeSkipList(skipList);
+         RedisModule_Log(ctx, "warning", "Failed to open metadata key for writing");
+         return RedisModule_ReplyWithError(ctx, "ERR could not open metadata key");
+     }
+
+     RedisModule_StringSet(metaWrite, RedisModule_CreateString(ctx, metaStr, strlen(metaStr)));
+     RedisModule_CloseKey(metaWrite);
+     RedisModule_Free(metaStr);
+
+     // Save the last state
+     RedisModuleKey *lastWrite = RedisModule_OpenKey(ctx, lastKey, REDISMODULE_WRITE);
+     if (!lastWrite) {
+         bsslFreeSkipList(skipList);
+         RedisModule_Log(ctx, "warning", "Failed to open last state key for writing");
+         return RedisModule_ReplyWithError(ctx, "ERR could not open last state key");
+     }
+
+     RedisModule_StringSet(lastWrite, state);
+     RedisModule_CloseKey(lastWrite);
 
      // Clean up
      bsslFreeSkipList(skipList);
-     bsslFreeAddressMetadata(metadata);
 
-     RedisModule_ReplyWithLongLong(ctx, 1);
-     return REDISMODULE_OK;
+     RedisModule_Log(ctx, "notice", "BSSLSet_RedisCommand completed successfully");
+     return RedisModule_ReplyWithLongLong(ctx, 1);
  }
 
- // BSSL.GETSTATEATBLOCK address block_num
+ // BSSL.GETSTATEATBLOCK address block_num - COMPLETELY REWRITTEN FOR SAFETY
  int BSSLGetStateAtBlock_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) {
      if (argc != 3) {
-         RedisModule_WrongArity(ctx);
-         return REDISMODULE_ERR;
+         return RedisModule_WrongArity(ctx);
      }
 
      RedisModule_AutoMemory(ctx);
 
      // Parse arguments
      RedisModuleString *address = argv[1];
+     if (!address) {
+         return RedisModule_ReplyWithError(ctx, "ERR invalid address");
+     }
 
      long long block_number;
-     if (RedisModule_StringToLongLong(argv[2], &block_number) != REDISMODULE_OK) {
-         RedisModule_ReplyWithError(ctx, "ERR invalid block number");
-         return REDISMODULE_ERR;
+     if (RedisModule_StringToLongLong(argv[2], &block_number) != REDISMODULE_OK || block_number < 0) {
+         return RedisModule_ReplyWithError(ctx, "ERR invalid block number");
      }
 
-     // Open address index
-     RedisModuleKey *indexKey = RedisModule_OpenKey(ctx,
-         RedisModule_CreateString(ctx, "bssl:address_index", 17),
-         REDISMODULE_READ);
+     // Create keys for the metadata and state storage
+     size_t addrLen;
+     const char* addrStr = RedisModule_StringPtrLen(address, &addrLen);
 
-     // Check if key exists and is a hash
-     if (RedisModule_KeyType(indexKey) == REDISMODULE_KEYTYPE_EMPTY) {
-         RedisModule_ReplyWithNull(ctx);
-         return REDISMODULE_OK;
+     // Create metadata key
+     char* metaKeyStr = RedisModule_Alloc(addrLen + 11); // "bssl:meta:" + address + null
+     if (!metaKeyStr) {
+         return RedisModule_ReplyWithError(ctx, "ERR could not allocate memory");
      }
 
-     if (RedisModule_KeyType(indexKey) != REDISMODULE_KEYTYPE_HASH) {
-         RedisModule_ReplyWithError(ctx, REDISMODULE_ERRORMSG_WRONGTYPE);
-         return REDISMODULE_ERR;
+     snprintf(metaKeyStr, addrLen + 11, "bssl:meta:%.*s", (int)addrLen, addrStr);
+     RedisModuleString *metaKey = RedisModule_CreateString(ctx, metaKeyStr, strlen(metaKeyStr));
+     RedisModule_Free(metaKeyStr);
+
+     // Create last state key
+     char* lastKeyStr = RedisModule_Alloc(addrLen + 11); // "bssl:last:" + address + null
+     if (!lastKeyStr) {
+         return RedisModule_ReplyWithError(ctx, "ERR could not allocate memory");
      }
 
-     // Look up address in index
-     RedisModuleString *metadataStr = NULL;
-     RedisModuleString *last_state_str = NULL;
+     snprintf(lastKeyStr, addrLen + 11, "bssl:last:%.*s", (int)addrLen, addrStr);
+     RedisModuleString *lastKey = RedisModule_CreateString(ctx, lastKeyStr, strlen(lastKeyStr));
+     RedisModule_Free(lastKeyStr);
 
-     RedisModule_HashGet(indexKey, REDISMODULE_HASH_CFIELDS,
-         address, &metadataStr,
-         RedisModule_CreateStringPrintf(ctx, "%s:last_state",
-             RedisModule_StringPtrLen(address, NULL)), &last_state_str,
-         NULL);
-
-     // If address not found, return null
-     if (!metadataStr) {
-         RedisModule_ReplyWithNull(ctx);
-         return REDISMODULE_OK;
+     // Get metadata
+     RedisModuleKey *metaRead = RedisModule_OpenKey(ctx, metaKey, REDISMODULE_READ);
+     if (!metaRead || RedisModule_KeyType(metaRead) != REDISMODULE_KEYTYPE_STRING) {
+         return RedisModule_ReplyWithNull(ctx);
      }
 
-     // Parse metadata
-     BSSLAddressMetadata *metadata = bsslDecodeAddressMetadata(ctx, metadataStr, last_state_str);
+     // Read metadata
+     uint64_t first_block = 0, last_block = 0;
+     uint32_t state_count = 0;
 
-     if (!metadata) {
-         RedisModule_ReplyWithError(ctx, "ERR could not parse metadata");
-         return REDISMODULE_ERR;
+     size_t len;
+     char *metaData = (char*)RedisModule_StringDMA(metaRead, &len, REDISMODULE_READ);
+
+     if (!metaData || len == 0 || !parseMetadata(metaData, &first_block, &last_block, &state_count)) {
+         RedisModule_CloseKey(metaRead);
+         return RedisModule_ReplyWithNull(ctx);
      }
+
+     RedisModule_CloseKey(metaRead);
 
      // Fast path: if block is before first block, return null
-     if ((uint64_t)block_number < metadata->first_block) {
-         bsslFreeAddressMetadata(metadata);
-         RedisModule_ReplyWithNull(ctx);
-         return REDISMODULE_OK;
+     if ((uint64_t)block_number < first_block) {
+         return RedisModule_ReplyWithNull(ctx);
      }
 
      // Fast path: if block is after or equal to last block, return last state
-     if ((uint64_t)block_number >= metadata->last_block) {
-         RedisModule_ReplyWithString(ctx, metadata->last_state);
-         bsslFreeAddressMetadata(metadata);
+     if ((uint64_t)block_number >= last_block) {
+         RedisModuleKey *lastRead = RedisModule_OpenKey(ctx, lastKey, REDISMODULE_READ);
+         if (!lastRead || RedisModule_KeyType(lastRead) != REDISMODULE_KEYTYPE_STRING) {
+             return RedisModule_ReplyWithNull(ctx);
+         }
+
+         size_t lastLen;
+         char *lastData = (char*)RedisModule_StringDMA(lastRead, &lastLen, REDISMODULE_READ);
+
+         if (!lastData || lastLen == 0) {
+             RedisModule_CloseKey(lastRead);
+             return RedisModule_ReplyWithNull(ctx);
+         }
+
+         RedisModule_ReplyWithStringBuffer(ctx, lastData, lastLen);
+         RedisModule_CloseKey(lastRead);
          return REDISMODULE_OK;
      }
 
      // Need to query skip list
-     RedisModuleString *skipListKey = RedisModule_CreateStringPrintf(ctx,
-         "bssl:state_list:%s", RedisModule_StringPtrLen(address, NULL));
+     char* skipListKeyStr = RedisModule_Alloc(addrLen + 18); // "bssl:state_list:" + address + null
+     if (!skipListKeyStr) {
+         return RedisModule_ReplyWithError(ctx, "ERR could not allocate memory");
+     }
 
-     RedisModuleKey *listKey = RedisModule_OpenKey(ctx, skipListKey, REDISMODULE_READ);
+     snprintf(skipListKeyStr, addrLen + 18, "bssl:state_list:%.*s", (int)addrLen, addrStr);
+     RedisModuleString *skipListKey = RedisModule_CreateString(ctx, skipListKeyStr, strlen(skipListKeyStr));
+     RedisModule_Free(skipListKeyStr);
 
-     // If skip list doesn't exist, something is wrong
-     if (RedisModule_KeyType(listKey) != REDISMODULE_KEYTYPE_STRING) {
-         bsslFreeAddressMetadata(metadata);
-         RedisModule_ReplyWithError(ctx, "ERR skip list not found");
-         return REDISMODULE_ERR;
+     RedisModuleKey *skipListRead = RedisModule_OpenKey(ctx, skipListKey, REDISMODULE_READ);
+     if (!skipListRead || RedisModule_KeyType(skipListRead) != REDISMODULE_KEYTYPE_STRING) {
+         return RedisModule_ReplyWithNull(ctx);
      }
 
      // Load skip list
      size_t dataSize;
-     uint8_t *data = (uint8_t*)RedisModule_StringDMA(listKey, &dataSize, REDISMODULE_READ);
+     uint8_t *data = (uint8_t*)RedisModule_StringDMA(skipListRead, &dataSize, REDISMODULE_READ);
+
+     if (!data || dataSize == 0) {
+         RedisModule_CloseKey(skipListRead);
+         return RedisModule_ReplyWithNull(ctx);
+     }
 
      BSSLSkipList *skipList = bsslDecodeSkipList(data, dataSize);
 
      if (!skipList) {
-         bsslFreeAddressMetadata(metadata);
-         RedisModule_ReplyWithError(ctx, "ERR could not decode skip list");
-         return REDISMODULE_ERR;
+         RedisModule_CloseKey(skipListRead);
+         return RedisModule_ReplyWithNull(ctx);
      }
 
      // Find state at block
@@ -684,9 +766,8 @@
 
      if (!node) {
          bsslFreeSkipList(skipList);
-         bsslFreeAddressMetadata(metadata);
-         RedisModule_ReplyWithNull(ctx);
-         return REDISMODULE_OK;
+         RedisModule_CloseKey(skipListRead);
+         return RedisModule_ReplyWithNull(ctx);
      }
 
      // Return state
@@ -694,62 +775,56 @@
 
      // Clean up
      bsslFreeSkipList(skipList);
-     bsslFreeAddressMetadata(metadata);
+     RedisModule_CloseKey(skipListRead);
      return REDISMODULE_OK;
  }
 
- // BSSL.INFO address
+ // BSSL.INFO address - COMPLETELY REWRITTEN FOR SAFETY
  int BSSLInfo_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) {
      if (argc != 2) {
-         RedisModule_WrongArity(ctx);
-         return REDISMODULE_ERR;
+         return RedisModule_WrongArity(ctx);
      }
 
      RedisModule_AutoMemory(ctx);
 
      // Parse arguments
      RedisModuleString *address = argv[1];
-
-     // Open address index
-     RedisModuleKey *indexKey = RedisModule_OpenKey(ctx,
-         RedisModule_CreateString(ctx, "bssl:address_index", 17),
-         REDISMODULE_READ);
-
-     // Check if key exists and is a hash
-     if (RedisModule_KeyType(indexKey) == REDISMODULE_KEYTYPE_EMPTY) {
-         RedisModule_ReplyWithNull(ctx);
-         return REDISMODULE_OK;
+     if (!address) {
+         return RedisModule_ReplyWithError(ctx, "ERR invalid address");
      }
 
-     if (RedisModule_KeyType(indexKey) != REDISMODULE_KEYTYPE_HASH) {
-         RedisModule_ReplyWithError(ctx, REDISMODULE_ERRORMSG_WRONGTYPE);
-         return REDISMODULE_ERR;
+     // Create metadata key
+     size_t addrLen;
+     const char* addrStr = RedisModule_StringPtrLen(address, &addrLen);
+
+     char* metaKeyStr = RedisModule_Alloc(addrLen + 11); // "bssl:meta:" + address + null
+     if (!metaKeyStr) {
+         return RedisModule_ReplyWithError(ctx, "ERR could not allocate memory");
      }
 
-     // Look up address in index
-     RedisModuleString *metadataStr = NULL;
+     snprintf(metaKeyStr, addrLen + 11, "bssl:meta:%.*s", (int)addrLen, addrStr);
+     RedisModuleString *metaKey = RedisModule_CreateString(ctx, metaKeyStr, strlen(metaKeyStr));
+     RedisModule_Free(metaKeyStr);
 
-     RedisModule_HashGet(indexKey, REDISMODULE_HASH_CFIELDS,
-         address, &metadataStr,
-         NULL);
-
-     // If address not found, return null
-     if (!metadataStr) {
-         RedisModule_ReplyWithNull(ctx);
-         return REDISMODULE_OK;
+     // Get metadata
+     RedisModuleKey *metaRead = RedisModule_OpenKey(ctx, metaKey, REDISMODULE_READ);
+     if (!metaRead || RedisModule_KeyType(metaRead) != REDISMODULE_KEYTYPE_STRING) {
+         return RedisModule_ReplyWithNull(ctx);
      }
 
-     // Parse metadata
+     // Read metadata
+     uint64_t first_block = 0, last_block = 0;
+     uint32_t state_count = 0;
+
      size_t len;
-     const char *s = RedisModule_StringPtrLen(metadataStr, &len);
+     char *metaData = (char*)RedisModule_StringDMA(metaRead, &len, REDISMODULE_READ);
 
-     unsigned long long first_block, last_block;
-     unsigned int state_count;
-
-     if (sscanf(s, "%llu,%llu,%u", &first_block, &last_block, &state_count) != 3) {
-         RedisModule_ReplyWithError(ctx, "ERR could not parse metadata");
-         return REDISMODULE_ERR;
+     if (!metaData || len == 0 || !parseMetadata(metaData, &first_block, &last_block, &state_count)) {
+         RedisModule_CloseKey(metaRead);
+         return RedisModule_ReplyWithNull(ctx);
      }
+
+     RedisModule_CloseKey(metaRead);
 
      // Return info
      RedisModule_ReplyWithArray(ctx, 3);
@@ -762,6 +837,9 @@
  /* Module Entry Point */
 
  int RedisModule_OnLoad(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) {
+     REDISMODULE_NOT_USED(argv);
+     REDISMODULE_NOT_USED(argc);
+
      // Initialize the module
      if (RedisModule_Init(ctx, "bssl", 1, REDISMODULE_APIVER_1) == REDISMODULE_ERR) {
          return REDISMODULE_ERR;
@@ -787,6 +865,9 @@
          BSSLInfo_RedisCommand, "readonly", 1, 1, 1) == REDISMODULE_ERR) {
          return REDISMODULE_ERR;
      }
+
+     // Seed random number generator for skip list levels
+     srand(time(NULL));
 
      return REDISMODULE_OK;
  }

@@ -19,12 +19,7 @@ else
 	SHOBJ_LDFLAGS=-bundle -undefined dynamic_lookup
 endif
 
-# Default target: build both minimal and full versions
-all: minimal_bssl.so bssl.so
-
-# Minimal module for testing
-minimal_bssl.so: minimal_bssl.c redismodule.h
-	$(CC) $(CFLAGS) $(SHOBJ_CFLAGS) -o $@ $< $(SHOBJ_LDFLAGS)
+all: bssl.so
 
 # Complete BSSL module
 bssl.so: bssl.c redismodule.h
@@ -33,10 +28,5 @@ bssl.so: bssl.c redismodule.h
 clean:
 	$(RM) *.o *.so
 
-test: minimal_bssl.so
-	@echo "Testing minimal BSSL module..."
-	@redis-server --test-memory 1 --loadmodule ./minimal_bssl.so || echo "Module loading failed!"
-	@redis-cli ping
-	@echo "Done."
 
 .PHONY: all clean test

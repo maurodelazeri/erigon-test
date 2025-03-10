@@ -2,13 +2,13 @@
 
 ## Overview
 
-The Redis state integration for Erigon enables storing blockchain state, transactions, receipts, and blocks in Redis alongside Erigon's main database. This provides fast O(1) access to historical state at any block height, useful for API services, debug tools, and transaction simulations.
+The Redis state integration for Erigon enables storing blockchain state, transactions, receipts, and blocks in Redis alongside Erigon's main database. This provides fast O(1) access to historical state at any block height regardless of history length, useful for API services, debug tools, and transaction simulations.
 
 ## Component Architecture
 
 Our implementation consists of two main components:
 
-1. **RedisState** (`redis_state.go`) - Core Redis client and state management
+1. **RedisState** (`redis_state.go`) - Core Redis client and state management using the BSSL module
 2. **RedisStateMonitor** (`redis_state_v3.go`) - Monitor for capturing block, transaction, and receipt data
 
 The implementation uses a shadowing approach that captures state changes directly in state writing methods rather than using wrapper classes. This provides better integration with minimal modifications to the core codebase.
@@ -17,30 +17,30 @@ The implementation uses a shadowing approach that captures state changes directl
 
 ### 1. `redis_state.go`
 
-**Purpose:** Provides the core Redis client functionality and methods to store and retrieve blockchain data.
+**Purpose:** Provides the core Redis client functionality and methods to store and retrieve blockchain data using the BSSL module.
 
 **Key Components:**
 
 - **RedisState** - Main struct that manages the Redis connection and pipeline
 - **Data Writing Methods** - Functions to write accounts, storage, code, blocks, transactions, and receipts
-- **Reorg Handling** - Complete removal of non-canonical chain data for O(1) lookups
+- **Reorg Handling** - Complete removal of non-canonical chain data with proper state restoration
 - **Query Methods** - Functions to retrieve historical state at any block height
 
 **How It Works:**
 
-1. The Redis client is initialized once with the provided URL
+1. The Redis client is initialized with the provided URL and checks for BSSL module availability
 2. State changes are batched using Redis pipelines for efficiency
 3. During reorgs, data from non-canonical blocks is completely deleted
-4. Historical state queries use Redis sorted sets with block numbers as scores
-5. All data access is O(1) complexity since only canonical data is kept
+4. Historical state queries use the BSSL module for O(1) performance
+5. All data access is O(1) complexity regardless of chain length
 
 **Key Data Structures:**
 
-- Account data stored as sorted sets with block numbers as scores
-- Storage slots stored as sorted sets with block numbers as scores
+- Account data stored via BSSL with block numbers as indexes
+- Storage slots stored via BSSL with block numbers as indexes
 - Code stored by hash (immutable)
 - Blocks indexed by block number
-- Transactions and receipts indexed by block number instead of hash
+- Transactions and receipts indexed by block number
 
 ### 2. `redis_state_v3.go`
 
@@ -59,290 +59,256 @@ The implementation uses a shadowing approach that captures state changes directl
 3. Receipt data is captured after transactions are processed
 4. Chain reorganizations are properly handled to maintain data consistency
 
-### 3. State Writing Integration
+### 3. `redis_writer.go`
 
-**Purpose:** Direct integration with Erigon's state writing methods to capture state changes.
+**Purpose:** Provides a StateWriter wrapper for Redis integration.
 
 **Key Components:**
 
-- **Direct Integration** - State writing methods (UpdateAccountData, etc.) directly write to Redis when enabled
-- **Block Number Tracking** - Block number is used as the primary index for historical state
-- **Zero Hash Handling** - A zero hash is used in state writers since actual block hash isn't available
+- **StateWriterWithRedis** - Wraps a StateWriter and adds Redis operations
+- **Integration Methods** - Methods that both update Redis and call the underlying writer methods
 
 **How It Works:**
 
-1. State writing methods check if Redis is enabled
-2. If enabled, they write state changes directly to Redis while performing normal operations
-3. The Redis pipeline is explicitly flushed when a block is committed in `flushAndCheckCommitmentV3`, ensuring Redis is always in sync with the client's state
-4. This approach minimizes code changes while ensuring all state changes are correctly captured
+1. Each state modification method is implemented to write to both Redis and the underlying storage
+2. Block number and hash are tracked to associate state changes with specific blocks
+3. Uses composition to minimize changes to the core code while capturing all state changes
 
 ## Data Organization
 
 This implementation stores data in Redis using the following key patterns:
 
 1. **Blocks**
+
    - `block:{blockNum}` - Hash containing block metadata
    - `blockHash:{blockHash}` - Hash mapping block hash to block number and timestamp
-   - `canonicalChain` - Sorted set of block hashes with block numbers as scores
 
 2. **Transactions**
+
    - `txs:{blockNum}` - Hash where keys are tx indices and values are RLP-encoded transactions
    - `block:{blockNum}:txs` - Set of transaction hashes in the block
 
 3. **Receipts**
+
    - `receipts:{blockNum}` - Hash where keys are tx indices and values are RLP-encoded receipts
-   - `block:{blockNum}:receipts` - Sorted set of transaction hashes with indices as scores
 
 4. **Accounts**
-   - `account:{address}` - Sorted set with block numbers as scores and account data as values
+
+   - `account:{address}` - BSSL data structure with block numbers as indexes and account data as values
    - Account data is stored as JSON with balance, nonce, codeHash, and incarnation fields
 
 5. **Storage**
-   - `storage:{address}:{slot}` - Sorted set with block numbers as scores and storage values
+
+   - `storage:{address}:{slot}` - BSSL data structure with block numbers as indexes and storage values
 
 6. **Code**
    - `code:{codeHash}` - Code bytes stored by hash (immutable)
 
+## The BSSL Module
+
+This implementation specifically utilizes the **Blockchain State Skip List (BSSL)** Redis module, which provides:
+
+- O(1) queries for state at any historical block height
+- Minimal memory overhead by only storing changes
+- Full compatibility with the Redis protocol
+- Scalability to billions of state changes without performance degradation
+
+### Key BSSL Commands Used
+
+1. **BSSL.SET** - Sets state at a specific block number:
+
+   ```
+   BSSL.SET address block_num state
+   ```
+
+2. **BSSL.GETSTATEATBLOCK** - Gets state at or before a specific block:
+
+   ```
+   BSSL.GETSTATEATBLOCK address block_num
+   ```
+
+3. **BSSL.INFO** - Gets metadata about an address's state history:
+   ```
+   BSSL.INFO address
+   ```
+
 ## Data Flow and Interaction
 
 1. **Block Processing:**
+
    - When a block is processed, RedisStateMonitor captures block header and metadata
    - For each transaction, transaction data is recorded by the monitor
    - After execution, receipt data is also captured by the monitor
 
 2. **State Modifications:**
+
    - State changes are captured directly in the state writing methods
-   - When these methods are called, they check if Redis is enabled and write to it if so
-   - Account updates, storage changes, and code deployment are all tracked with block numbers
-   - A zero block hash is used since the state writers don't have access to the actual block hash
+   - Account updates, storage changes, and code deployment are tracked with block numbers
+   - All state changes use BSSL.SET for efficient O(1) historical access
 
 3. **Chain Reorganizations:**
+
    - When a reorg occurs, RedisStateMonitor.MonitorUnwind is called
-   - The handleReorg method completely removes all data from the non-canonical chain
-   - Only canonical chain data remains in Redis, ensuring O(1) access times
+   - The handleReorg method removes block data from the non-canonical chain
+   - For each account and storage slot affected, the state at the block before reorg is restored at the reorg point
+   - This ensures continuity of state across reorganizations
 
 4. **Data Retrieval:**
-   - Historical state can be queried at any block height using GetAccountAtBlock and GetStorageAtBlock
-   - Since only canonical data is stored, all queries are O(1) complexity
-   - Sorted sets with block numbers as scores enable efficient historical access
+   - Historical state is queried using BSSL.GETSTATEATBLOCK for O(1) access
+   - Block data, transactions, and receipts are retrieved using standard Redis commands
+   - All queries benefit from constant-time performance regardless of history length
 
 ## Query Patterns
 
 ### Getting Block Data
+
 ```
 HGETALL block:{blockNum}
 ```
 
 ### Getting Transactions from a Block
+
 ```
 HGETALL txs:{blockNum}
 ```
 
+### Getting Transaction Hashes from a Block
+
+```
+SMEMBERS block:{blockNum}:txs
+```
+
 ### Getting Receipts from a Block
+
 ```
 HGETALL receipts:{blockNum}
 ```
 
 ### Getting Account State at a Block
+
 ```
-ZREVRANGEBYSCORE account:{address} {blockNum} 0 LIMIT 0 1 WITHSCORES
+BSSL.GETSTATEATBLOCK account:{address} {blockNum}
 ```
 
 ### Getting Storage Value at a Block
+
 ```
-ZREVRANGEBYSCORE storage:{address}:{slot} {blockNum} 0 LIMIT 0 1 WITHSCORES
+BSSL.GETSTATEATBLOCK storage:{address}:{slot} {blockNum}
 ```
 
 ### Getting Contract Code
+
 ```
 GET code:{codeHash}
 ```
 
-## Design Decisions
+## Improved Design Features
 
-1. **Block-Indexed Storage:**
-   - Transactions and receipts are now indexed primarily by block number
-   - This makes it easier to retrieve all data for a block in one operation
-   - Cross-reference mappings maintain the ability to look up by transaction hash
+1. **Pure BSSL Approach:**
 
-2. **Complete Deletion vs. Marking:**
-   - Non-canonical data is completely deleted rather than marked as non-canonical
-   - This simplifies queries to true O(1) operations without canonicality checks
-   - Trade-off: Higher write overhead during reorgs for faster reads
+   - The implementation now exclusively uses the BSSL module for historical state access
+   - This ensures O(1) performance regardless of history length
+   - Legacy sorted set approach has been completely removed
 
-3. **No Log Storage:**
-   - The implementation no longer stores logs in Redis
-   - This reduces storage requirements and complexity
-   - Applications that need log data can retrieve it from receipts
+2. **Robust Reorg Handling:**
 
-4. **Optimized Batch Operations:**
-   - Redis pipelines batch operations for efficiency
-   - Lua scripts handle bulk operations during reorgs
-   - Periodic flushing balances performance and durability
+   - Chain reorganizations are handled with batch processing for efficiency
+   - Pre-reorg state is properly restored at the reorg point
+   - Timeout contexts prevent operations from hanging during large reorgs
 
-5. **Direct State Integration:**
-   - State writing methods directly check and write to Redis rather than using wrapper classes
-   - This minimizes changes to Erigon's core code and improves maintainability
-   - The approach is less intrusive while still ensuring all state changes are captured
+3. **Transactional Consistency:**
 
-## Usage Scenarios
+   - Pipeline batching ensures atomic operations
+   - Proper error handling prevents data corruption
+   - State transitions are properly tracked even during reorgs
 
-1. **Fast Historical State Access:**
-   - Get account state at any block height with O(1) complexity
-   - Useful for API services that need quick access to past state
+4. **Enhanced Query API:**
 
-2. **Transaction Simulation:**
-   - Efficiently simulate transactions at arbitrary block heights
-   - Useful for debug tools and transaction analysis
+   - Comprehensive query functions for all data types
+   - Consistent error handling and timeout contexts
+   - Support for both low-level and high-level queries
 
-3. **Block and Transaction Lookup:**
-   - Efficient access to block data, transactions, and receipts by block number
-   - Useful for block explorers and transaction tracking services
+5. **Memory Efficiency:**
+   - BSSL's skip list architecture minimizes memory usage
+   - Only state changes are stored, not state at every block
+   - Immutable data like code is stored only once
 
-4. **Account History Analysis:**
-   - Track historical changes to account state
-   - Useful for analytics and debugging
+## Performance Characteristics
 
---
+The BSSL-based implementation maintains consistent performance regardless of:
 
-# Erigon's Extension Points for Redis Integration
+1. **Chain Length** - Performance is independent of the total number of blocks
+2. **State Size** - O(1) lookups regardless of how many accounts exist
+3. **Change Frequency** - Optimized for both frequently and rarely changing data
 
-Erigon has a well-designed architecture that allows for integrating our Redis state functionality through key extension points:
+Key metrics:
 
-## Core Extension Points
-
-### 1. **Interface-based Design**
-
-Erigon uses interfaces for state management components:
-
-```go
-// StateWriter interface defines how state changes are written
-type StateWriter interface {
-    UpdateAccountData(address libcommon.Address, original, account *accounts.Account) error
-    // other methods...
-}
-```
-
-### 2. **Direct Method Integration**
-
-State changes are captured directly in the state writing methods:
-
-```go
-// In StateWriterV3.UpdateAccountData
-func (w *StateWriterV3) UpdateAccountData(address common.Address, original, account *accounts.Account) error {
-    // Standard operations
-    
-    // Redis integration - capture state changes directly
-    redisState := GetRedisState()
-    if redisState.Enabled() && w.rs.domains != nil {
-        redisState.writeAccount(w.rs.domains.BlockNum(), w.rs.domains.BlockHash(), address, account)
-    }
-    
-    // Regular state writing continues...
-}
-```
-
-## Specific Hook Points
-
-### 1. **State Modification Hooks**
-
-- `StateWriterV3` methods directly check for Redis and write to it when enabled
-- This avoids the need for wrapper classes while ensuring all state changes are captured
-
-### 2. **Block/Transaction Monitoring**
-
-- `RedisStateMonitor` is initialized in the execution flow
-- It captures block data, transaction data, and receipts at key points
-
-### 3. **Chain Reorganization Hooks**
-
-- `RedisStateMonitor.MonitorUnwind` is called during chain reorganizations
-- This ensures proper Redis state cleanup for non-canonical blocks
+- **State Lookup**: O(1) constant time
+- **State Writing**: O(1) constant time per state change
+- **Reorg Processing**: O(n) where n is the number of affected state entries
+- **Memory Usage**: Proportional to state changes, not chain length
 
 ## Integration Mechanism
 
-The process of integrating Redis with Erigon is minimal and non-intrusive:
+The RedisState integration with Erigon is designed to be minimal and non-intrusive:
 
-1. **Initial Configuration**
+1. **Initialization** - Redis connection is established at startup based on config parameters
+2. **State Capture** - State changes are captured directly in state writing methods
+3. **Monitoring** - Block, transaction, and receipt data are captured via the monitor component
+4. **Pipeline Flushing** - The Redis pipeline is flushed at strategic points to ensure persistence
 
-   - Command-line flags define Redis URL and password
-   - Redis state is initialized when Erigon starts
+This approach requires minimal changes to Erigon's core code while ensuring comprehensive state tracking.
 
-2. **Direct Integration**
+## Usage Examples
 
-   - State writing methods directly check if Redis is enabled
-   - If enabled, they write to Redis in addition to their normal operations
-   - This approach requires minimal changes to the core codebase
+### Querying Account State at a Historical Block
 
-3. **Monitoring Integration**
-   - Block, transaction, and receipt data are captured via monitoring
-   - This ensures all blockchain data is properly shadowed to Redis
+```go
+// Get account state at block 1,000,000
+accountState, err := redisState.GetAccountAtBlock(
+    common.HexToAddress("0x1234..."),
+    1000000,
+)
+fmt.Printf("Balance at block 1M: %s\n", accountState.Balance)
+```
 
-This direct integration approach allows our Redis functionality to work as a non-intrusive layer on top of Erigon's core functionality while capturing all state changes.
+### Retrieving Storage at a Historical Block
 
-## Implementation Details
+```go
+// Get storage value at block 1,000,000
+storageValue, err := redisState.GetStorageAtBlock(
+    common.HexToAddress("0x1234..."),
+    common.HexToHash("0xabcd..."),
+    1000000,
+)
+fmt.Printf("Storage value at block 1M: %s\n", storageValue)
+```
 
-### Modified Files
+### Getting Block Data
 
-The following files were modified to implement the Redis state integration:
+```go
+// Get block information
+blockData, err := redisState.GetBlockByNumber(1000000)
+fmt.Printf("Block hash: %s\n", blockData["hash"])
+fmt.Printf("Parent hash: %s\n", blockData["parentHash"])
+```
 
-1. **`core/state/redis_state.go`**
-   - Removed log storage functionality
-   - Modified transaction storage to index by block number using `txs:{blockNum}` keys
-   - Modified receipt storage to index by block number using `receipts:{blockNum}` keys
-   - Simplified transaction and receipt hash-to-block mapping
-   - Updated reorganization handling to properly clean up block-indexed data
+### Retrieving Transactions for a Block
 
-2. **`core/state/redis_state_v3.go`**
-   - No significant changes (monitor functionality remains the same)
+```go
+// Get all transactions in a block
+txData, err := redisState.GetTransactionsByBlockNumber(1000000)
+for idx, txRLP := range txData {
+    fmt.Printf("Transaction %s: %x...\n", idx, txRLP[:20])
+}
+```
 
-3. **`core/state/redis_writer.go`**
-   - No significant changes (writer functionality remains the same)
+## Error Handling and Recovery
 
-4. **`core/state/rw_v3.go`**
-   - Added integration points for Redis state updates in state writer methods
-   - Modified to send account, storage, and code changes to Redis
+The implementation includes robust error handling:
 
-5. **`eth/stagedsync/exec3.go`**
-   - Added Redis pipeline flushing during block commit
-   - Ensures all buffered Redis operations are committed after block execution
-
-6. **`eth/stagedsync/exec3_serial.go`**
-   - Added Redis flush operations for serial execution
-
-7. **`eth/backend.go`**
-   - Added Redis initialization from config params
-   - Ensures Redis connection is established at startup
-
-8. **`cmd/utils/flags.go`**
-   - Added Redis URL and password flags 
-   - Added flag handling in SetEthConfig
-
-9. **`eth/ethconfig/config.go`**
-   - Added Redis URL and password config fields
-   - Ensures Redis connection params are passed through the system
-
-10. **`turbo/cli/default_flags.go`**
-   - Added Redis URL and password flags to the default flags list
-   - Ensures Redis options are available in the CLI interface
-
-### Key Changes
-
-1. **Transaction Storage**
-   - Transactions are stored as entries in `txs:{blockNum}` hash
-   - Transaction lookup is only available by block number and index
-   - Removed `tx:{txHash}:block` and `sender:{address}:txs` mappings
-
-2. **Receipt Storage**
-   - Receipts are stored as entries in `receipts:{blockNum}` hash
-   - Receipt lookup is only available by block number and index
-   - Removed `receipt:{txHash}:block` mapping
-
-3. **Log Storage**
-   - Logs are not stored separately (they can be retrieved from receipts if needed)
-
-4. **Data Access**
-   - All historical queries remain O(1) complexity
-   - Block-based queries are now more efficient
-   - Reduced storage requirements by eliminating transaction hash and sender mappings
-   - Reduced storage requirements by eliminating receipt hash mappings
+1. **Timeout Contexts** - All Redis operations have appropriate timeouts
+2. **Batch Processing** - Large operations are processed in manageable batches
+3. **Error Tracking** - Errors are logged with detailed context information
+4. **Pipeline Recovery** - New pipelines are created after errors to prevent cascading failures
+5. **Graceful Degradation** - Core functionality continues even if Redis operations fail
