@@ -1,314 +1,459 @@
-# Redis State Integration for Erigon - Developer Documentation
+# Redis State Integration for Erigon
 
-## Overview
+## Introduction
 
-The Redis state integration for Erigon enables storing blockchain state, transactions, receipts, and blocks in Redis alongside Erigon's main database. This provides fast O(1) access to historical state at any block height regardless of history length, useful for API services, debug tools, and transaction simulations.
+The Redis state integration allows Erigon to store blockchain data in Redis, making it possible to instantly access historical state from any block height. Instead of having to replay transactions or recreate historical states, you can query an account or storage slot's value at any point in history with consistent O(1) performance.
 
-## Component Architecture
+This document explains how the integration works, how data is stored, and how to query it - all without requiring prior knowledge of the system.
 
-Our implementation consists of two main components:
+## Why Use Redis for Blockchain State?
 
-1. **RedisState** (`redis_state.go`) - Core Redis client and state management using the BSSL module
-2. **RedisStateMonitor** (`redis_state_v3.go`) - Monitor for capturing block, transaction, and receipt data
+Traditional blockchain nodes struggle to provide efficient access to historical state. Redis integration solves this by:
 
-The implementation uses a shadowing approach that captures state changes directly in state writing methods rather than using wrapper classes. This provides better integration with minimal modifications to the core codebase.
+- **Speed**: O(1) access to any historical state regardless of chain length
+- **Simplicity**: Simple query patterns to retrieve historical data
+- **Flexibility**: Ability to support APIs, transaction simulations, and debugging tools
+- **Efficiency**: Skip list technology minimizes storage by only tracking changes
 
-## File Descriptions
+## Component Overview
 
-### 1. `redis_state.go`
+The Redis integration consists of three main components:
 
-**Purpose:** Provides the core Redis client functionality and methods to store and retrieve blockchain data using the BSSL module.
+1. **RedisState** (`redis_state.go`): Core client that manages Redis connection and provides data access
+2. **RedisStateMonitor** (`redis_state_v3.go`): Captures block, transaction, and receipt data
+3. **StateWriterWithRedis** (`redis_writer.go`): Captures state changes (accounts, storage, code)
 
-**Key Components:**
+These components work together to track all blockchain data without requiring major changes to Erigon's core code.
 
-- **RedisState** - Main struct that manages the Redis connection and pipeline
-- **Data Writing Methods** - Functions to write accounts, storage, code, blocks, transactions, and receipts
-- **Reorg Handling** - Complete removal of non-canonical chain data with proper state restoration
-- **Query Methods** - Functions to retrieve historical state at any block height
+## How Data is Stored in Redis
 
-**How It Works:**
+### The BSSL Module
 
-1. The Redis client is initialized with the provided URL and checks for BSSL module availability
-2. State changes are batched using Redis pipelines for efficiency
-3. During reorgs, data from non-canonical blocks is completely deleted
-4. Historical state queries use the BSSL module for O(1) performance
-5. All data access is O(1) complexity regardless of chain length
+At the heart of this integration is the **Blockchain State Skip List (BSSL)** Redis module, which provides efficient storage and retrieval of historical state using specialized skip list data structures.
 
-**Key Data Structures:**
+The BSSL module stores data with a block number index, allowing you to find state "at or before" any given block. It only stores data when it changes, which means storage requirements are proportional to the number of state changes rather than the total number of blocks.
 
-- Account data stored via BSSL with block numbers as indexes
-- Storage slots stored via BSSL with block numbers as indexes
-- Code stored by hash (immutable)
-- Blocks indexed by block number
-- Transactions and receipts indexed by block number
+### Data Types and Key Patterns
 
-### 2. `redis_state_v3.go`
-
-**Purpose:** Provides monitoring capabilities to capture block, transaction, and receipt data during execution.
-
-**Key Components:**
-
-- **RedisStateMonitor** - Monitors state changes for Redis integration
-- **Monitoring Methods** - Functions to record block, transaction, and receipt data
-- **Chain Reorganization Handler** - Special handling for chain reorganizations
-
-**How It Works:**
-
-1. Block data is captured in the execution flow during block processing
-2. Transaction data is captured when transactions are executed
-3. Receipt data is captured after transactions are processed
-4. Chain reorganizations are properly handled to maintain data consistency
-
-### 3. `redis_writer.go`
-
-**Purpose:** Provides a StateWriter wrapper for Redis integration.
-
-**Key Components:**
-
-- **StateWriterWithRedis** - Wraps a StateWriter and adds Redis operations
-- **Integration Methods** - Methods that both update Redis and call the underlying writer methods
-
-**How It Works:**
-
-1. Each state modification method is implemented to write to both Redis and the underlying storage
-2. Block number and hash are tracked to associate state changes with specific blocks
-3. Uses composition to minimize changes to the core code while capturing all state changes
-
-## Data Organization
-
-This implementation stores data in Redis using the following key patterns:
-
-1. **Blocks**
-
-   - `block:{blockNum}` - Hash containing block metadata
-   - `blockHash:{blockHash}` - Hash mapping block hash to block number and timestamp
-
-2. **Transactions**
-
-   - `txs:{blockNum}` - Hash where keys are tx indices and values are RLP-encoded transactions
-   - `block:{blockNum}:txs` - Set of transaction hashes in the block
-
-3. **Receipts**
-
-   - `receipts:{blockNum}` - Hash where keys are tx indices and values are RLP-encoded receipts
-
-4. **Accounts**
-
-   - `account:{address}` - BSSL data structure with block numbers as indexes and account data as values
-   - Account data is stored as JSON with balance, nonce, codeHash, and incarnation fields
-
-5. **Storage**
-
-   - `storage:{address}:{slot}` - BSSL data structure with block numbers as indexes and storage values
-
-6. **Code**
-   - `code:{codeHash}` - Code bytes stored by hash (immutable)
-
-## The BSSL Module
-
-This implementation specifically utilizes the **Blockchain State Skip List (BSSL)** Redis module, which provides:
-
-- O(1) queries for state at any historical block height
-- Minimal memory overhead by only storing changes
-- Full compatibility with the Redis protocol
-- Scalability to billions of state changes without performance degradation
-
-### Key BSSL Commands Used
-
-1. **BSSL.SET** - Sets state at a specific block number:
-
-   ```
-   BSSL.SET address block_num state
-   ```
-
-2. **BSSL.GETSTATEATBLOCK** - Gets state at or before a specific block:
-
-   ```
-   BSSL.GETSTATEATBLOCK address block_num
-   ```
-
-3. **BSSL.INFO** - Gets metadata about an address's state history:
-   ```
-   BSSL.INFO address
-   ```
-
-## Data Flow and Interaction
-
-1. **Block Processing:**
-
-   - When a block is processed, RedisStateMonitor captures block header and metadata
-   - For each transaction, transaction data is recorded by the monitor
-   - After execution, receipt data is also captured by the monitor
-
-2. **State Modifications:**
-
-   - State changes are captured directly in the state writing methods
-   - Account updates, storage changes, and code deployment are tracked with block numbers
-   - All state changes use BSSL.SET for efficient O(1) historical access
-
-3. **Chain Reorganizations:**
-
-   - When a reorg occurs, RedisStateMonitor.MonitorUnwind is called
-   - The handleReorg method removes block data from the non-canonical chain
-   - For each account and storage slot affected, the state at the block before reorg is restored at the reorg point
-   - This ensures continuity of state across reorganizations
-
-4. **Data Retrieval:**
-   - Historical state is queried using BSSL.GETSTATEATBLOCK for O(1) access
-   - Block data, transactions, and receipts are retrieved using standard Redis commands
-   - All queries benefit from constant-time performance regardless of history length
-
-## Query Patterns
-
-### Getting Block Data
+#### 1. Account Data
 
 ```
-HGETALL block:{blockNum}
+Key: account:{address}
+Example: account:0x1f9840a85d5aF5bf1D1762F925BDADdC4201F984
+Storage: BSSL module
 ```
 
-### Getting Transactions from a Block
+Account data is stored as JSON with these fields:
 
-```
-HGETALL txs:{blockNum}
-```
-
-### Getting Transaction Hashes from a Block
-
-```
-SMEMBERS block:{blockNum}:txs
-```
-
-### Getting Receipts from a Block
-
-```
-HGETALL receipts:{blockNum}
+```json
+{
+  "balance": "1234567890",
+  "nonce": 5,
+  "codeHash": "0x1234abcd...",
+  "incarnation": 1
+}
 ```
 
-### Getting Account State at a Block
+#### 2. Contract Storage
+
+```
+Key: storage:{address}:{slot}
+Example: storage:0x1f9840a85d5aF5bf1D1762F925BDADdC4201F984:0x8f0162f3d08f8d0712b4c2b179f86fce4e93a879b8b7d140aa82eb91cf66215e
+Storage: BSSL module
+```
+
+Storage data is stored as JSON:
+
+```json
+{
+  "value": "0x000000000000000000000000000000000000000000000000000000000000002a"
+}
+```
+
+When a storage slot is deleted (set to zero), the value is stored as:
+
+```json
+{
+  "value": "null"
+}
+```
+
+#### 3. Contract Code
+
+```
+Key: code:{codeHash}
+Example: code:0xabcd1234...
+Storage: Regular Redis string (immutable)
+```
+
+Code is stored as raw binary data. Since code is immutable (can't change once deployed), it's stored using `SetNX` to ensure it's only written once.
+
+#### 4. Block Data
+
+```
+Key: block:{blockNum}
+Example: block:15000000
+Storage: Redis hash (HSET)
+```
+
+Block data has these fields:
+
+```
+hash: 0x8f5bab218b6bb34476f51ca588e9f4553a3a7ce5e13a66c660a5283e97e9a85a
+parentHash: 0x61d05e8f9c448d998d4c862be75ed7dbe540e3f9a6e32838b286380a5ea68244
+stateRoot: 0xabc123...
+timestamp: 1676392017
+number: 15000000
+```
+
+#### 5. Block Hash Mapping
+
+```
+Key: blockHash:{blockHash}
+Example: blockHash:0x8f5bab218b6bb34476f51ca588e9f4553a3a7ce5e13a66c660a5283e97e9a85a
+Storage: Redis hash (HSET)
+```
+
+Block hash mapping has these fields:
+
+```
+number: 15000000
+timestamp: 1676392017
+```
+
+#### 6. Transactions
+
+```
+Key: txs:{blockNum}
+Example: txs:15000000
+Storage: Redis hash where keys are tx indices (0, 1, 2...)
+```
+
+Each transaction is stored as RLP-encoded binary data.
+
+#### 7. Receipts
+
+```
+Key: receipts:{blockNum}
+Example: receipts:15000000
+Storage: Redis hash where keys are tx indices (0, 1, 2...)
+```
+
+Each receipt is stored as RLP-encoded binary data.
+
+#### 8. Current Block Tracker
+
+```
+Key: currentBlock
+Storage: Simple string value
+```
+
+Stores the latest processed block number.
+
+### Behind the Scenes: BSSL Internal Keys
+
+While your application code shouldn't need to interact with these directly, it's helpful to understand that BSSL internally uses these key patterns:
+
+```
+bssl:state_list:{type}:{address}[:slot] - Stores the skip list data structure
+bssl:meta:{type}:{address}[:slot] - Stores metadata about state changes
+bssl:last:{type}:{address}[:slot] - Caches the latest state
+```
+
+You might see these when using `KEYS` or other Redis commands, but you should use the BSSL module commands to interact with the data instead.
+
+## How to Query Data
+
+### Account State at a Block Height
+
+To get an account's state at a specific block:
 
 ```
 BSSL.GETSTATEATBLOCK account:{address} {blockNum}
 ```
 
-### Getting Storage Value at a Block
+Example:
+
+```
+BSSL.GETSTATEATBLOCK account:0x1f9840a85d5aF5bf1D1762F925BDADdC4201F984 15000000
+```
+
+Response (JSON string):
+
+```
+{"balance":"1234567890","nonce":5,"codeHash":"0x1234abcd...","incarnation":1}
+```
+
+If the account didn't exist at that block, you'll get a null response.
+
+### Storage Value at a Block Height
+
+To get a storage slot's value at a specific block:
 
 ```
 BSSL.GETSTATEATBLOCK storage:{address}:{slot} {blockNum}
 ```
 
-### Getting Contract Code
+Example:
+
+```
+BSSL.GETSTATEATBLOCK storage:0x1f9840a85d5aF5bf1D1762F925BDADdC4201F984:0x8f0162f3d08f8d0712b4c2b179f86fce4e93a879b8b7d140aa82eb91cf66215e 15000000
+```
+
+Response (JSON string):
+
+```
+{"value":"0x000000000000000000000000000000000000000000000000000000000000002a"}
+```
+
+### Block Data
+
+To get block information:
+
+```
+HGETALL block:{blockNum}
+```
+
+Example:
+
+```
+HGETALL block:15000000
+```
+
+Response:
+
+```
+1) "hash"
+2) "0x8f5bab218b6bb34476f51ca588e9f4553a3a7ce5e13a66c660a5283e97e9a85a"
+3) "parentHash"
+4) "0x61d05e8f9c448d998d4c862be75ed7dbe540e3f9a6e32838b286380a5ea68244"
+5) "stateRoot"
+6) "0xabc123..."
+7) "timestamp"
+8) "1676392017"
+9) "number"
+10) "15000000"
+```
+
+### Transactions in a Block
+
+To get all transactions in a block:
+
+```
+HGETALL txs:{blockNum}
+```
+
+Example:
+
+```
+HGETALL txs:15000000
+```
+
+Response (hash where keys are indices and values are RLP-encoded transactions):
+
+```
+1) "0"
+2) "{RLP encoded tx data}"
+3) "1"
+4) "{RLP encoded tx data}"
+...
+```
+
+### Receipts in a Block
+
+To get all receipts in a block:
+
+```
+HGETALL receipts:{blockNum}
+```
+
+Example:
+
+```
+HGETALL receipts:15000000
+```
+
+Response (hash where keys are indices and values are RLP-encoded receipts):
+
+```
+1) "0"
+2) "{RLP encoded receipt data}"
+3) "1"
+4) "{RLP encoded receipt data}"
+...
+```
+
+### Contract Code
+
+To get contract code:
 
 ```
 GET code:{codeHash}
 ```
 
-## Improved Design Features
+Example:
 
-1. **Pure BSSL Approach:**
+```
+GET code:0xabcd1234...
+```
 
-   - The implementation now exclusively uses the BSSL module for historical state access
-   - This ensures O(1) performance regardless of history length
-   - Legacy sorted set approach has been completely removed
+Response: raw binary code
 
-2. **Robust Reorg Handling:**
+### Latest Block Number
 
-   - Chain reorganizations are handled with batch processing for efficiency
-   - Pre-reorg state is properly restored at the reorg point
-   - Timeout contexts prevent operations from hanging during large reorgs
+To get the latest processed block number:
 
-3. **Transactional Consistency:**
+```
+GET currentBlock
+```
 
-   - Pipeline batching ensures atomic operations
-   - Proper error handling prevents data corruption
-   - State transitions are properly tracked even during reorgs
+### Metadata About an Address's History
 
-4. **Enhanced Query API:**
+To get information about when an address's state has changed:
 
-   - Comprehensive query functions for all data types
-   - Consistent error handling and timeout contexts
-   - Support for both low-level and high-level queries
+```
+BSSL.INFO account:{address}
+```
 
-5. **Memory Efficiency:**
-   - BSSL's skip list architecture minimizes memory usage
-   - Only state changes are stored, not state at every block
-   - Immutable data like code is stored only once
+Example:
 
-## Performance Characteristics
+```
+BSSL.INFO account:0x1f9840a85d5aF5bf1D1762F925BDADdC4201F984
+```
 
-The BSSL-based implementation maintains consistent performance regardless of:
+Response:
 
-1. **Chain Length** - Performance is independent of the total number of blocks
-2. **State Size** - O(1) lookups regardless of how many accounts exist
-3. **Change Frequency** - Optimized for both frequently and rarely changing data
+```
+1) (integer) 12000000  # First block where state exists
+2) (integer) 15000000  # Last block where state changed
+3) (integer) 27        # Number of state changes
+```
 
-Key metrics:
+## Understanding State Queries
 
-- **State Lookup**: O(1) constant time
-- **State Writing**: O(1) constant time per state change
-- **Reorg Processing**: O(n) where n is the number of affected state entries
-- **Memory Usage**: Proportional to state changes, not chain length
+When you query for state at a block, the system returns the state as it was at that block. If the state didn't change at exactly that block, it returns the most recent state change before or at the requested block.
 
-## Integration Mechanism
+For example:
 
-The RedisState integration with Erigon is designed to be minimal and non-intrusive:
+- Account changes at block 100
+- Account changes at block 500
+- Account changes at block 1000
 
-1. **Initialization** - Redis connection is established at startup based on config parameters
-2. **State Capture** - State changes are captured directly in state writing methods
-3. **Monitoring** - Block, transaction, and receipt data are captured via the monitor component
-4. **Pipeline Flushing** - The Redis pipeline is flushed at strategic points to ensure persistence
+If you query for block 750, you'll get the state from block 500, since that was the most recent change before block 750.
 
-This approach requires minimal changes to Erigon's core code while ensuring comprehensive state tracking.
+## Understanding Reorgs
 
-## Usage Examples
+Chain reorganizations (reorgs) happen when the blockchain forks and a non-canonical chain becomes canonical. The Redis integration handles this by:
 
-### Querying Account State at a Historical Block
+1. Detecting the reorg point (where the chain diverged)
+2. Deleting all block data, transactions, and receipts from the non-canonical chain
+3. Restoring state at the reorg point to match what it was before the reorg
+4. Updating Redis to reflect the new canonical chain
+
+This ensures that historical queries return accurate results even after reorgs.
+
+## Go API Examples
+
+Here are examples of querying data using the Go API:
+
+### Get Account at Block
 
 ```go
 // Get account state at block 1,000,000
 accountState, err := redisState.GetAccountAtBlock(
-    common.HexToAddress("0x1234..."),
+    common.HexToAddress("0x1f9840a85d5aF5bf1D1762F925BDADdC4201F984"),
     1000000,
 )
+if err != nil {
+    log.Fatal("Error getting account:", err)
+}
 fmt.Printf("Balance at block 1M: %s\n", accountState.Balance)
+fmt.Printf("Nonce at block 1M: %d\n", accountState.Nonce)
 ```
 
-### Retrieving Storage at a Historical Block
+### Get Storage at Block
 
 ```go
 // Get storage value at block 1,000,000
 storageValue, err := redisState.GetStorageAtBlock(
-    common.HexToAddress("0x1234..."),
-    common.HexToHash("0xabcd..."),
+    common.HexToAddress("0x1f9840a85d5aF5bf1D1762F925BDADdC4201F984"),
+    common.HexToHash("0x8f0162f3d08f8d0712b4c2b179f86fce4e93a879b8b7d140aa82eb91cf66215e"),
     1000000,
 )
+if err != nil {
+    log.Fatal("Error getting storage:", err)
+}
 fmt.Printf("Storage value at block 1M: %s\n", storageValue)
 ```
 
-### Getting Block Data
+### Get Block Data
 
 ```go
 // Get block information
 blockData, err := redisState.GetBlockByNumber(1000000)
+if err != nil {
+    log.Fatal("Error getting block:", err)
+}
 fmt.Printf("Block hash: %s\n", blockData["hash"])
 fmt.Printf("Parent hash: %s\n", blockData["parentHash"])
 ```
 
-### Retrieving Transactions for a Block
+### Get Transactions
 
 ```go
 // Get all transactions in a block
 txData, err := redisState.GetTransactionsByBlockNumber(1000000)
+if err != nil {
+    log.Fatal("Error getting transactions:", err)
+}
 for idx, txRLP := range txData {
     fmt.Printf("Transaction %s: %x...\n", idx, txRLP[:20])
 }
 ```
 
-## Error Handling and Recovery
+## Best Practices
 
-The implementation includes robust error handling:
+1. **Use BSSL Commands**: Always use the BSSL module commands for state queries rather than trying to access internal keys directly.
 
-1. **Timeout Contexts** - All Redis operations have appropriate timeouts
-2. **Batch Processing** - Large operations are processed in manageable batches
-3. **Error Tracking** - Errors are logged with detailed context information
-4. **Pipeline Recovery** - New pipelines are created after errors to prevent cascading failures
-5. **Graceful Degradation** - Core functionality continues even if Redis operations fail
+2. **Batch Operations**: For bulk operations, use Redis pipelines to reduce round-trip time.
+
+3. **Handle Null Results**: State might not exist at a particular block, so always check for null/nil results.
+
+4. **Timeout Handling**: Set appropriate timeouts for Redis operations to prevent hanging during network issues.
+
+5. **Error Recovery**: The integration includes automatic pipeline recovery for errors, but your application should handle Redis errors gracefully.
+
+## Troubleshooting
+
+### Common Issues
+
+1. **No Data Found**: Make sure you're querying at or after the block where the state was created. If you query before the first state change, you'll get a null result.
+
+2. **Inconsistent State**: After a reorg, there might be a brief period where data is being updated. If you encounter inconsistencies, try again after a few seconds.
+
+3. **Redis Connection Issues**: Check Redis connection settings and network connectivity. The integration includes automatic reconnection, but persistent connectivity problems will affect functionality.
+
+4. **Performance Degradation**: If you're experiencing slow queries, check Redis memory usage and consider increasing the available memory.
+
+## Monitoring and Diagnostics
+
+You can check the status of the Redis integration using:
+
+1. **Check BSSL Module**: Make sure the BSSL module is loaded
+
+   ```
+   BSSL.PING
+   ```
+
+   Should return "PONG"
+
+2. **Check Current Block**: See the latest processed block
+
+   ```
+   GET currentBlock
+   ```
+
+3. **Check Account Info**: Get metadata about an address
+   ```
+   BSSL.INFO account:0x1f9840a85d5aF5bf1D1762F925BDADdC4201F984
+   ```

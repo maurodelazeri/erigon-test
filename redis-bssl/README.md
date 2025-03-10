@@ -67,7 +67,6 @@ For most accounts/storage slots that change infrequently, this provides massive 
 
 ```bash
 # Clone the repository
-git clone https://github.com/your-org/redis-bssl
 cd redis-bssl
 
 # Build the module
