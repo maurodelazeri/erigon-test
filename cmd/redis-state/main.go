@@ -1416,9 +1416,8 @@ func (api *DebugAPI) GetStorageAt(ctx context.Context, address libcommon.Address
 			}
 		} else {
 			// Remove 0x prefix if present
-			if strings.HasPrefix(blockNrOrHash, "0x") {
-				blockNrOrHash = blockNrOrHash[2:]
-			}
+			blockNrOrHash = strings.TrimPrefix(blockNrOrHash, "0x")
+
 			blockNum, err = strconv.ParseUint(blockNrOrHash, 16, 64)
 			if err != nil {
 				return "", fmt.Errorf("invalid block number: %s", blockNrOrHash)
@@ -1446,10 +1445,9 @@ func (api *DebugAPI) GetStorageAt(ctx context.Context, address libcommon.Address
 		return "", fmt.Errorf("failed to read storage data: %w", err)
 	}
 
-	if storageData == nil || len(storageData) == 0 {
+	if len(storageData) == 0 {
 		return "0x0000000000000000000000000000000000000000000000000000000000000000", nil
 	}
-
 	// Pad the value to 32 bytes
 	value := libcommon.BytesToHash(storageData)
 	return value.Hex(), nil
