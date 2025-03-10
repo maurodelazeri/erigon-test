@@ -92,7 +92,6 @@ import (
 	"github.com/erigontech/erigon/core/rawdb"
 	"github.com/erigontech/erigon/core/rawdb/blockio"
 	snaptype2 "github.com/erigontech/erigon/core/snaptype"
-	"github.com/erigontech/erigon/core/state"
 	"github.com/erigontech/erigon/core/types"
 	"github.com/erigontech/erigon/core/vm"
 	"github.com/erigontech/erigon/eth/consensuschain"
@@ -118,7 +117,6 @@ import (
 	"github.com/erigontech/erigon/polygon/bridge"
 	"github.com/erigontech/erigon/polygon/heimdall"
 	polygonsync "github.com/erigontech/erigon/polygon/sync"
-	redisstate "github.com/erigontech/erigon/redis-state"
 	"github.com/erigontech/erigon/rpc"
 	"github.com/erigontech/erigon/turbo/builder"
 	"github.com/erigontech/erigon/turbo/engineapi"
@@ -353,41 +351,6 @@ func New(ctx context.Context, stack *node.Node, config *ethconfig.Config, logger
 	backend.chainDB, err = temporal.New(rawChainDB, agg)
 	if err != nil {
 		return nil, err
-	}
-
-	// Initialize Redis if URL is provided
-	if stack.Config().Redis.URL != "" {
-		fmt.Printf("REDIS_BACKEND: Redis URL detected: %s\n", stack.Config().Redis.URL)
-		logger.Info("Initializing Redis state integration", "url", stack.Config().Redis.URL)
-		if err := redisstate.InitializeRedisClient(context.Background(), stack.Config().Redis.URL, stack.Config().Redis.Password, logger); err != nil {
-			fmt.Printf("REDIS_BACKEND_ERROR: Failed to initialize Redis client: %v\n", err)
-			logger.Warn("Failed to initialize Redis client", "err", err)
-			// We don't return error as Redis is optional and shouldn't prevent Erigon from starting
-		} else {
-			// Create and register the Redis writer factory with the state package
-			// This is the critical connection point that makes the Redis integration work
-			writerFactoryFn := redisstate.GetRedisWriterFactoryFn()
-			fmt.Printf("REDIS_BACKEND: Got writer factory function, registering with state package\n")
-			state.SetRedisWriterFactory(writerFactoryFn)
-			fmt.Printf("REDIS_BACKEND: Redis writer factory registered with state package\n")
-
-			// Verify Redis connection and initialization
-			diagnostics := redisstate.DiagnoseRedisConnection()
-			fmt.Printf("REDIS_BACKEND: Redis diagnostics status: %v\n", diagnostics["status"])
-			if diagnostics["status"] == "connected" {
-				logger.Info("Redis state integration initialized and verified",
-					"address", diagnostics["address"],
-					"connected", diagnostics["status"] == "connected",
-					"write_success", diagnostics["write_success"])
-			} else {
-				fmt.Printf("REDIS_BACKEND_ERROR: Redis connection issues: %v\n", diagnostics["error"])
-				logger.Error("Redis connection verified but may have issues",
-					"status", diagnostics["status"],
-					"error", diagnostics["error"])
-			}
-		}
-	} else {
-		fmt.Printf("REDIS_BACKEND: Redis URL not provided, Redis integration disabled\n")
 	}
 
 	// Can happen in some configurations

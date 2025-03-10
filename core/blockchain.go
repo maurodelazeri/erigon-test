@@ -96,14 +96,6 @@ func ExecuteBlockEphemerally(
 	block.Uncles()
 	ibs := state.New(stateReader)
 	header := block.Header()
-	
-	// Set block context for Redis state integration
-	// This is critical for Redis to track the block number
-	ibs.SetBlockContext(header.Number.Uint64())
-	
-	if state.IsRedisEnabled() {
-		logger.Debug("Redis state integration: set block context", "block", header.Number.Uint64())
-	}
 
 	usedGas := new(uint64)
 	usedBlobGas := new(uint64)
@@ -360,37 +352,6 @@ func FinalizeBlockExecution(
 			return nil, nil, nil, nil, fmt.Errorf("writing changesets for block %d failed: %w", header.Number.Uint64(), err)
 		}
 	}
-
-	// Redis integration - finalize block in Redis if enabled
-	if state.IsRedisEnabled() {
-		if redisWriter := state.GetRedisStateWriter(header.Number.Uint64()); redisWriter != nil {
-			if redisHistoryWriter, ok := redisWriter.(state.RedisHistoricalWriter); ok {
-				// Store block header and state root information
-				if err := redisHistoryWriter.StoreBlockInfo(header, header.Root); err != nil {
-					logger.Warn("Failed to store block info in Redis", "err", err, "block", header.Number.Uint64())
-				}
-				
-				// Write change sets to Redis
-				fmt.Printf("REDIS_BLOCKCHAIN: Writing change sets for block %d\n", header.Number.Uint64())
-				if err := redisHistoryWriter.WriteChangeSets(); err != nil {
-					fmt.Printf("REDIS_BLOCKCHAIN_ERROR: Failed to write change sets to Redis for block %d: %v\n", header.Number.Uint64(), err)
-					logger.Warn("Failed to write Redis change sets", "err", err, "block", header.Number.Uint64())
-				} else {
-					fmt.Printf("REDIS_BLOCKCHAIN: Successfully wrote change sets for block %d\n", header.Number.Uint64())
-				}
-
-				// Write history to Redis
-				fmt.Printf("REDIS_BLOCKCHAIN: Writing history for block %d\n", header.Number.Uint64())
-				if err := redisHistoryWriter.WriteHistory(); err != nil {
-					fmt.Printf("REDIS_BLOCKCHAIN_ERROR: Failed to write history to Redis for block %d: %v\n", header.Number.Uint64(), err)
-					logger.Warn("Failed to write Redis history", "err", err, "block", header.Number.Uint64())
-				} else {
-					fmt.Printf("REDIS_BLOCKCHAIN: Successfully wrote history for block %d\n", header.Number.Uint64())
-				}
-			}
-		}
-	}
-
 	return newBlock, newTxs, newReceipt, retRequests, nil
 }
 

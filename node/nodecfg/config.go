@@ -171,9 +171,6 @@ type Config struct {
 	HealthCheck bool
 
 	Http httpcfg.HttpCfg
-	
-	// Redis configuration for state persistence
-	Redis RedisConfig
 }
 
 // IPCEndpoint resolves an IPC endpoint based on a configured value, taking into
@@ -334,15 +331,6 @@ func (c *Config) parsePersistentNodes(w *bool, path string, logger log.Logger) [
 		nodes = append(nodes, node)
 	}
 	return nodes
-}
-
-// RedisConfig holds Redis-related configuration
-type RedisConfig struct {
-	// URL is the Redis connection URL
-	// Redis is automatically enabled when URL is not empty
-	URL string
-	// Password for Redis authentication
-	Password string
 }
 
 var warnLock sync.Mutex

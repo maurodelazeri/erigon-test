@@ -27,7 +27,6 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"github.com/erigontech/erigon/cmd/state/exec3"
-	redisstate "github.com/erigontech/erigon/redis-state"
 
 	"github.com/erigontech/erigon-lib/chain"
 	"github.com/erigontech/erigon-lib/common"
@@ -191,13 +190,6 @@ func unwindExec3(u *UnwindState, s *StageState, txc wrap.TxContainer, ctx contex
 
 	t := time.Now()
 	var changeset *[kv.DomainLen][]libstate.DomainEntryDiff
-	
-	// Track blocks to unwind in Redis if it's enabled
-	var blocksToUnwind []uint64
-	if state.IsRedisEnabled() {
-		blocksToUnwind = make([]uint64, 0, u.CurrentBlockNumber-u.UnwindPoint)
-	}
-	
 	for currentBlock := u.CurrentBlockNumber; currentBlock > u.UnwindPoint; currentBlock-- {
 		currentHash, ok, err := br.CanonicalHash(ctx, txc.Tx, currentBlock)
 		if err != nil {
@@ -221,26 +213,10 @@ func unwindExec3(u *UnwindState, s *StageState, txc wrap.TxContainer, ctx contex
 				changeset[i] = libstate.MergeDiffSets(changeset[i], currentKeys[i])
 			}
 		}
-		
-		// Track block for Redis unwind
-		if state.IsRedisEnabled() {
-			blocksToUnwind = append(blocksToUnwind, currentBlock)
-		}
 	}
-	
 	if err := rs.Unwind(ctx, txc.Tx, u.UnwindPoint, txNum, accumulator, changeset); err != nil {
 		return fmt.Errorf("StateV3.Unwind(%d->%d): %w, took %s", s.BlockNumber, u.UnwindPoint, err, time.Since(t))
 	}
-	
-	// Handle Redis unwind if Redis is enabled
-	if state.IsRedisEnabled() {
-		// Handle chain reorganization in Redis using the new utility function
-		if err := redisstate.HandleChainReorg(u.CurrentBlockNumber, u.UnwindPoint, logger); err != nil {
-			// Log error but don't fail the unwind process
-			logger.Warn("Failed to handle Redis chain reorg", "err", err)
-		}
-	}
-	
 	if err := rawdb.DeleteNewerEpochs(txc.Tx, u.UnwindPoint+1); err != nil {
 		return fmt.Errorf("delete newer epochs: %w", err)
 	}

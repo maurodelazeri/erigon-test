@@ -55,8 +55,6 @@ var DefaultFlags = []cli.Flag{
 	&StateStreamDisableFlag,
 	&SyncLoopThrottleFlag,
 	&BadBlockFlag,
-	&RedisURLFlag,
-	&RedisPasswordFlag,
 
 	&utils.HTTPEnabledFlag,
 	&utils.HTTPServerEnabledFlag,

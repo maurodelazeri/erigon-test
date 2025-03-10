@@ -23,7 +23,6 @@ import (
 	"github.com/erigontech/erigon-lib/chain"
 	libcommon "github.com/erigontech/erigon-lib/common"
 	"github.com/erigontech/erigon-lib/crypto"
-	"github.com/erigontech/erigon-lib/log/v3"
 	"github.com/erigontech/erigon/consensus"
 	"github.com/erigontech/erigon/core/state"
 	"github.com/erigontech/erigon/core/types"
@@ -69,18 +68,6 @@ func applyTransaction(config *chain.Config, engine consensus.EngineReader, gp *G
 	if err = ibs.FinalizeTx(rules, stateWriter); err != nil {
 		return nil, nil, err
 	}
-	
-	// If Redis is enabled, write the state changes to Redis as well
-	if state.IsRedisEnabled() {
-		// Get redis writer using the factory pattern handled elsewhere
-		if redisWriter := state.GetRedisStateWriter(header.Number.Uint64()); redisWriter != nil {
-			if err = ibs.FinalizeTx(rules, redisWriter); err != nil {
-				// Log the error but don't fail the transaction
-				logger := log.Root()
-				logger.Warn("Failed to write transaction state to Redis", "err", err, "block", header.Number.Uint64(), "txHash", txn.Hash().String())
-			}
-		}
-	}
 	*usedGas += result.UsedGas
 	if usedBlobGas != nil {
 		*usedBlobGas += txn.GetBlobGas()
@@ -108,24 +95,6 @@ func applyTransaction(config *chain.Config, engine consensus.EngineReader, gp *G
 		receipt.Bloom = types.CreateBloom(types.Receipts{receipt})
 		receipt.BlockNumber = header.Number
 		receipt.TransactionIndex = uint(ibs.TxnIndex())
-	}
-
-	// Add Redis transaction and receipt handling
-	if state.IsRedisEnabled() && receipt != nil {
-		if redisWriter := state.GetRedisStateWriter(header.Number.Uint64()); redisWriter != nil {
-			// Set transaction index
-			redisWriter.SetTxNum(uint64(receipt.TransactionIndex))
-			
-			// Try to cast to RedisHistoricalWriter to use HandleTransaction
-			redisHistoryWriter, ok := redisWriter.(state.RedisHistoricalWriter)
-			if ok {
-				// Handle transaction and receipt
-				if err := redisHistoryWriter.HandleTransaction(txn, receipt, header.Number.Uint64(), uint64(receipt.TransactionIndex)); err != nil {
-					logger := log.Root()
-					logger.Warn("Failed to write transaction to Redis", "err", err, "block", header.Number.Uint64(), "txHash", txn.Hash().String())
-				}
-			}
-		}
 	}
 
 	return receipt, result.ReturnData, err

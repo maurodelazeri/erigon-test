@@ -196,13 +196,6 @@ func (rw *Worker) RunTxTaskNoLock(txTask *state.TxTask, isMining bool) {
 		rw.stateReader.SetTx(rw.chainTx)
 		rw.chain = consensuschain.NewReader(rw.chainConfig, rw.chainTx, rw.blockReader, rw.logger)
 	}
-	
-	// Set the block context for Redis integration
-	// This is the critical change needed to make Redis integration work
-	if state.IsRedisEnabled() && txTask.BlockNum > 0 {
-		rw.ibs.SetBlockContext(txTask.BlockNum)
-	}
-	
 	txTask.Error = nil
 
 	rw.stateReader.SetTxNum(txTask.TxNum)
