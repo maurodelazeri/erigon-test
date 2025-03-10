@@ -81,9 +81,9 @@ func (rm *RedisStateMonitor) MonitorUnwind(tx kv.RwTx, blockUnwindTo uint64) err
 		newCanonicalHash = libcommon.BytesToHash(newCanonicalBlock)
 	}
 
-	// Handle reorganization in Redis by completely deleting non-canonical data
+	// Handle reorganization in Redis
 	rm.redis.handleReorg(blockUnwindTo+1, newCanonicalHash)
-	
+
 	return nil
 }
 
