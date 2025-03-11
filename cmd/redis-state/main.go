@@ -42,6 +42,7 @@ import (
 	"github.com/erigontech/erigon-lib/common/hexutility"
 	"github.com/erigontech/erigon-lib/common/math"
 	"github.com/erigontech/erigon-lib/log/v3"
+	"github.com/erigontech/erigon-lib/rlp"
 	"github.com/erigontech/erigon-lib/types/accounts"
 	"github.com/erigontech/erigon/consensus"
 	"github.com/erigontech/erigon/consensus/ethash"
@@ -319,6 +320,12 @@ func contains(slice []string, item string) bool {
 // RedisStateProvider implementation
 // ==========================================================================
 
+// BlockHashJSON represents block hash to number mapping
+type BlockHashJSON struct {
+	Number    uint64 `json:"number"`
+	Timestamp uint64 `json:"timestamp"`
+}
+
 // RedisStateProvider provides blockchain state access via Redis
 type RedisStateProvider struct {
 	redisClient *redis.Client
@@ -386,36 +393,45 @@ func (r *RedisStateProvider) GetBlockByNumber(ctx context.Context, blockNumber r
 	}
 
 	// Get block data from Redis
-	result, err := r.redisClient.HGetAll(ctx, fmt.Sprintf("block:%d", blockNum)).Result()
+	blockKey := fmt.Sprintf("block:%d", blockNum)
+	blockData, err := r.redisClient.Get(ctx, blockKey).Bytes()
 	if err != nil {
-		return nil, err
-	}
-
-	if len(result) == 0 {
-		return nil, fmt.Errorf("block %d not found", blockNum)
-	}
-
-	// Parse block data
-	blockData := make(map[string]interface{})
-	for k, v := range result {
-		blockData[k] = v
-	}
-
-	// Convert block number to hex
-	if numStr, ok := blockData["number"]; ok {
-		num, err := strconv.ParseUint(numStr.(string), 10, 64)
-		if err == nil {
-			blockData["number"] = hexutil.EncodeUint64(num)
+		if err == redis.Nil {
+			return nil, fmt.Errorf("block %d not found", blockNum)
 		}
+		return nil, fmt.Errorf("failed to get block data: %w", err)
 	}
 
-	// Convert timestamp to hex
-	if timestampStr, ok := blockData["timestamp"]; ok {
-		timestamp, err := strconv.ParseUint(timestampStr.(string), 10, 64)
-		if err == nil {
-			blockData["timestamp"] = hexutil.EncodeUint64(timestamp)
-		}
+	// Decode RLP-encoded block header
+	var header types.Header
+	if err := rlp.DecodeBytes(blockData, &header); err != nil {
+		return nil, fmt.Errorf("failed to decode block header: %w", err)
 	}
+
+	// Format the block data
+	blockInfo := make(map[string]interface{})
+
+	// Set basic header fields
+	blockInfo["number"] = hexutil.EncodeUint64(header.Number.Uint64())
+	blockInfo["hash"] = header.Hash().Hex()
+	blockInfo["parentHash"] = header.ParentHash.Hex()
+	blockInfo["stateRoot"] = header.Root.Hex()
+	blockInfo["timestamp"] = hexutil.EncodeUint64(header.Time)
+
+	// Add additional fields
+	blockInfo["nonce"] = hexutil.EncodeUint64(header.Nonce.Uint64())
+	blockInfo["difficulty"] = (*hexutil.Big)(header.Difficulty)
+	blockInfo["extraData"] = hexutil.Encode(header.Extra)
+	blockInfo["size"] = hexutil.EncodeUint64(uint64(len(blockData)))
+	blockInfo["gasLimit"] = hexutil.EncodeUint64(header.GasLimit)
+	blockInfo["gasUsed"] = hexutil.EncodeUint64(header.GasUsed)
+	blockInfo["miner"] = header.Coinbase.Hex()
+
+	// Set totalDifficulty - in full implementation would be calculated
+	blockInfo["totalDifficulty"] = (*hexutil.Big)(header.Difficulty)
+
+	// Set empty uncles array
+	blockInfo["uncles"] = []interface{}{}
 
 	// Add empty transaction array or fetch transactions
 	if fullTx {
@@ -423,63 +439,82 @@ func (r *RedisStateProvider) GetBlockByNumber(ctx context.Context, blockNumber r
 		if err == nil && len(txs) > 0 {
 			txArray := make([]interface{}, 0, len(txs))
 			// Parse and add transactions
-			for idx := range txs {
-				// Add transaction index
-				txIndex, _ := strconv.Atoi(idx)
-
+			for i, tx := range txs {
 				// This would decode the transaction in a full implementation
 				// Here, we're just creating a placeholder
-				tx := map[string]interface{}{
-					"hash":             "0x" + strings.Repeat("0", 64), // Placeholder
-					"blockHash":        blockData["hash"],
-					"blockNumber":      blockData["number"],
-					"transactionIndex": hexutil.EncodeUint64(uint64(txIndex)),
+				txObj := map[string]interface{}{
+					"hash":             tx.Hash().Hex(),
+					"blockHash":        header.Hash().Hex(),
+					"blockNumber":      blockInfo["number"],
+					"transactionIndex": hexutil.EncodeUint64(uint64(i)),
+					"from":             "0x0000000000000000000000000000000000000000", // Would need to recover sender
+					"to":               tx.To().Hex(),                                // If contract creation, would be null
+					"value":            (*hexutil.Big)(tx.Value().ToBig()),
+					"gas":              hexutil.EncodeUint64(tx.Gas()),
+					"gasPrice":         (*hexutil.Big)(tx.GasPrice().ToBig()),
+					"input":            hexutil.Encode(tx.Data()),
+					"nonce":            hexutil.EncodeUint64(tx.Nonce()),
 				}
-				txArray = append(txArray, tx)
+				txArray = append(txArray, txObj)
 			}
-			blockData["transactions"] = txArray
+			blockInfo["transactions"] = txArray
 		} else {
-			blockData["transactions"] = []interface{}{}
+			blockInfo["transactions"] = []interface{}{}
 		}
 	} else {
-		blockData["transactions"] = []interface{}{}
-	}
-
-	// Add required fields with placeholders if not present
-	requiredFields := []string{
-		"difficulty", "totalDifficulty", "gasLimit", "gasUsed",
-		"size", "miner", "extraData", "uncles",
-	}
-
-	for _, field := range requiredFields {
-		if _, exists := blockData[field]; !exists {
-			switch field {
-			case "difficulty", "totalDifficulty", "gasLimit", "gasUsed", "size":
-				blockData[field] = "0x0"
-			case "miner":
-				blockData[field] = "0x0000000000000000000000000000000000000000"
-			case "extraData":
-				blockData[field] = "0x"
-			case "uncles":
-				blockData[field] = []interface{}{}
+		// Just return transaction hashes
+		txs, err := r.GetTransactionsByBlockNumber(ctx, blockNum)
+		if err == nil && len(txs) > 0 {
+			txHashes := make([]interface{}, 0, len(txs))
+			for _, tx := range txs {
+				txHashes = append(txHashes, tx.Hash().Hex())
 			}
+			blockInfo["transactions"] = txHashes
+		} else {
+			blockInfo["transactions"] = []interface{}{}
 		}
 	}
 
-	return blockData, nil
+	return blockInfo, nil
 }
 
 // GetTransactionsByBlockNumber retrieves all transactions in a block
-func (r *RedisStateProvider) GetTransactionsByBlockNumber(ctx context.Context, blockNum uint64) (map[string]string, error) {
-	// Get transaction data
-	txKey := fmt.Sprintf("txs:%d", blockNum)
-	txData, err := r.redisClient.HGetAll(ctx, txKey).Result()
-
+func (r *RedisStateProvider) GetTransactionsByBlockNumber(ctx context.Context, blockNum uint64) ([]types.Transaction, error) {
+	// Find all transaction keys for this block
+	pattern := fmt.Sprintf("txs:%d:*", blockNum)
+	txKeys, err := r.redisClient.Keys(ctx, pattern).Result()
 	if err != nil {
-		return nil, fmt.Errorf("transaction lookup failed: %w", err)
+		return nil, fmt.Errorf("failed to find transaction keys: %w", err)
 	}
 
-	return txData, nil
+	if len(txKeys) == 0 {
+		return []types.Transaction{}, nil
+	}
+
+	// Get each transaction and parse it
+	txs := make([]types.Transaction, 0, len(txKeys))
+
+	for _, key := range txKeys {
+		// Get transaction data
+		data, err := r.redisClient.Get(ctx, key).Bytes()
+		if err != nil {
+			if err == redis.Nil {
+				continue // Skip if not found
+			}
+			return nil, fmt.Errorf("failed to get transaction data for key %s: %w", key, err)
+		}
+
+		// Decode transaction
+		var tx types.Transaction
+		if err := rlp.DecodeBytes(data, &tx); err != nil {
+			r.logger.Warn("Failed to decode transaction", "key", key, "error", err)
+			continue
+		}
+
+		txs = append(txs, tx)
+	}
+
+	return txs, nil
 }
 
 // BalanceAt returns the account balance at the given address and block number
@@ -1044,26 +1079,15 @@ func (api *EthAPI) Call(ctx context.Context, args CallArgs, blockNumber string) 
 	}
 
 	// Get block info for execution context
-	blockInfo, err := api.stateProvider.GetBlockByNumber(ctx, blockNum, false)
+	blockData, err := api.stateProvider.GetRedisClient().Get(ctx, fmt.Sprintf("block:%d", uintBlockNum)).Bytes()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get block: %w", err)
 	}
 
-	// Create header from block info
-	header := &types.Header{
-		ParentHash: libcommon.HexToHash(blockInfo["parentHash"].(string)),
-		Root:       libcommon.HexToHash(blockInfo["stateRoot"].(string)),
-		Number:     new(big.Int).SetUint64(uintBlockNum),
-	}
-
-	// Parse timestamp if available
-	if timestamp, ok := blockInfo["timestamp"]; ok {
-		if timestampHex, ok := timestamp.(string); ok && strings.HasPrefix(timestampHex, "0x") {
-			timestampVal, err := hexutil.DecodeUint64(timestampHex)
-			if err == nil {
-				header.Time = timestampVal
-			}
-		}
+	// Decode RLP-encoded block header
+	var header types.Header
+	if err := rlp.DecodeBytes(blockData, &header); err != nil {
+		return nil, fmt.Errorf("failed to decode block header: %w", err)
 	}
 
 	// Set default gas cap if not provided
@@ -1112,13 +1136,19 @@ func (api *EthAPI) Call(ctx context.Context, args CallArgs, blockNumber string) 
 		}
 
 		// Try to get block hash from Redis
-		blockKey := fmt.Sprintf("block:%d", n)
-		blockData, err := api.stateProvider.GetRedisClient().HGet(ctx, blockKey, "hash").Result()
-		if err != nil || blockData == "" {
+		blockKeyHash := fmt.Sprintf("block:%d", n)
+		blockDataHash, err := api.stateProvider.GetRedisClient().Get(ctx, blockKeyHash).Bytes()
+		if err != nil {
 			return libcommon.Hash{}
 		}
 
-		return libcommon.HexToHash(blockData)
+		// Decode the block header to get its hash
+		var headerHash types.Header
+		if err := rlp.DecodeBytes(blockDataHash, &headerHash); err != nil {
+			return libcommon.Hash{}
+		}
+
+		return headerHash.Hash()
 	}
 
 	// Create a consensus engine (using consensus.EngineReader interface)
@@ -1129,7 +1159,7 @@ func (api *EthAPI) Call(ctx context.Context, args CallArgs, blockNumber string) 
 	}, nil, false)
 
 	// Create block context
-	blockContext := core.NewEVMBlockContext(header, getHashFn, consensusEngine, nil, chainConfig)
+	blockContext := core.NewEVMBlockContext(&header, getHashFn, consensusEngine, nil, chainConfig)
 
 	// Handle BaseFee which might be present in the header
 	var baseFee *uint256.Int
@@ -1304,36 +1334,9 @@ func (api *EthAPI) GetCode(ctx context.Context, address libcommon.Address, block
 }
 
 // GetBlockByNumber returns the block details for the given block number
-func (api *EthAPI) GetBlockByNumber(ctx context.Context, blockNumber string, fullTx bool) (map[string]interface{}, error) {
-	var blockNum rpc.BlockNumber
-
-	// Parse block number
-	if blockNumber == "latest" {
-		blockNum = rpc.LatestBlockNumber
-	} else if blockNumber == "pending" {
-		blockNum = rpc.PendingBlockNumber
-	} else if blockNumber == "earliest" {
-		blockNum = rpc.EarliestBlockNumber
-	} else {
-		// Parse hex string
-		if strings.HasPrefix(blockNumber, "0x") {
-			num, err := strconv.ParseUint(blockNumber[2:], 16, 64)
-			if err != nil {
-				return nil, fmt.Errorf("invalid block number: %s", blockNumber)
-			}
-			blockNum = rpc.BlockNumber(num)
-		} else {
-			// Try parsing as decimal
-			num, err := strconv.ParseUint(blockNumber, 10, 64)
-			if err != nil {
-				return nil, fmt.Errorf("invalid block number: %s", blockNumber)
-			}
-			blockNum = rpc.BlockNumber(num)
-		}
-	}
-
+func (api *EthAPI) GetBlockByNumber(ctx context.Context, blockNumber rpc.BlockNumber, fullTx bool) (map[string]interface{}, error) {
 	// Get block
-	return api.stateProvider.GetBlockByNumber(ctx, blockNum, fullTx)
+	return api.stateProvider.GetBlockByNumber(ctx, blockNumber, fullTx)
 }
 
 // EstimateGas estimates the gas needed for execution of a transaction
@@ -1398,14 +1401,18 @@ func (api *DebugAPI) GetStorageAt(ctx context.Context, address libcommon.Address
 	if strings.HasPrefix(blockNrOrHash, "0x") && len(blockNrOrHash) == 66 {
 		blockHash := libcommon.HexToHash(blockNrOrHash)
 		hashKey := fmt.Sprintf("blockHash:%s", blockHash.Hex())
-		result, err := api.stateProvider.GetRedisClient().Get(ctx, hashKey).Result()
+		hashData, err := api.stateProvider.GetRedisClient().Get(ctx, hashKey).Bytes()
 		if err != nil {
 			return "", fmt.Errorf("block hash not found: %s", blockHash.Hex())
 		}
-		blockNum, err = strconv.ParseUint(result, 10, 64)
-		if err != nil {
-			return "", fmt.Errorf("invalid block number for hash: %s", blockHash.Hex())
+
+		// Parse the JSON data to get the block number
+		var blockHashJSON BlockHashJSON
+		if err := json.Unmarshal(hashData, &blockHashJSON); err != nil {
+			return "", fmt.Errorf("failed to parse block hash data: %w", err)
 		}
+
+		blockNum = blockHashJSON.Number
 	} else {
 		// Assume it's a block number
 		var err error

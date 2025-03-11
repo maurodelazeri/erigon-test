@@ -171,7 +171,7 @@ func (api *DebugAPI) traceBlock(ctx context.Context, blockNrOrHash rpc.BlockNumb
 	if err != nil {
 		api.logger.Warn("Failed to retrieve transactions", "block", blockNum, "err", err)
 		// Continue with empty transaction list
-		txs = make(map[string]string)
+		txs = make([]types.Transaction, 0)
 	}
 
 	// Define call timeout
@@ -179,22 +179,24 @@ func (api *DebugAPI) traceBlock(ctx context.Context, blockNrOrHash rpc.BlockNumb
 
 	// Apply each transaction in order
 	var usedGas uint64
-	txIndex := 0
 
-	for txIdxStr, txDataStr := range txs {
-		// Parse transaction index
-		txIndex, err = strconv.Atoi(txIdxStr)
-		if err != nil {
-			api.logger.Warn("Invalid transaction index", "index", txIdxStr)
-			continue
+	for txIndex, tx := range txs {
+		// Create basic transaction data map
+		txData := map[string]interface{}{
+			"hash":   tx.Hash().Hex(),
+			"from":   "0x0000000000000000000000000000000000000000", // Would need to recover sender
 		}
-
-		// Parse transaction data
-		var txData map[string]interface{}
-		if err := json.Unmarshal([]byte(txDataStr), &txData); err != nil {
-			api.logger.Warn("Failed to parse transaction data", "err", err)
-			continue
+		
+		// Add other transaction fields
+		if to := tx.GetTo(); to != nil {
+			txData["to"] = to.Hex()
 		}
+		
+		txData["value"] = tx.GetValue().Hex()
+		txData["gas"] = hexutil.EncodeUint64(tx.GetGas())
+		txData["gasPrice"] = tx.GetPrice().Hex()
+		txData["input"] = hexutil.Encode(tx.GetData())
+		txData["nonce"] = hexutil.EncodeUint64(tx.GetNonce())
 
 		stream.WriteObjectStart()
 
