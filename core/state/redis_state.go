@@ -54,7 +54,6 @@ type RedisState struct {
 	pipelineMutex sync.Mutex
 	pipelineCount int
 	ctx           context.Context
-	// Track if BSSL module is available
 	bsslAvailable bool
 }
 

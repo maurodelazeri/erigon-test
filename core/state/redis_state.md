@@ -93,53 +93,47 @@ Code is stored as raw binary data. Since code is immutable (can't change once de
 ```
 Key: block:{blockNum}
 Example: block:15000000
-Storage: Redis hash (HSET)
+Storage: Redis string (SET)
 ```
 
-Block data has these fields:
-
-```
-hash: 0x8f5bab218b6bb34476f51ca588e9f4553a3a7ce5e13a66c660a5283e97e9a85a
-parentHash: 0x61d05e8f9c448d998d4c862be75ed7dbe540e3f9a6e32838b286380a5ea68244
-stateRoot: 0xabc123...
-timestamp: 1676392017
-number: 15000000
-```
+Block data is stored as RLP-encoded binary data of the entire block header. This allows for efficient storage and retrieval of complete block information.
 
 #### 5. Block Hash Mapping
 
 ```
 Key: blockHash:{blockHash}
 Example: blockHash:0x8f5bab218b6bb34476f51ca588e9f4553a3a7ce5e13a66c660a5283e97e9a85a
-Storage: Redis hash (HSET)
+Storage: Redis string (SET)
 ```
 
-Block hash mapping has these fields:
+Block hash mapping is stored as JSON:
 
-```
-number: 15000000
-timestamp: 1676392017
+```json
+{
+  "number": 15000000,
+  "timestamp": 1676392017
+}
 ```
 
 #### 6. Transactions
 
 ```
-Key: txs:{blockNum}
-Example: txs:15000000
-Storage: Redis hash where keys are tx indices (0, 1, 2...)
+Key: txs:{blockNum}:{txIndex}
+Example: txs:15000000:0, txs:15000000:1, txs:15000000:2...
+Storage: Redis string (SET)
 ```
 
-Each transaction is stored as RLP-encoded binary data.
+Each transaction is stored as RLP-encoded binary data in its own key, with the transaction index included in the key.
 
 #### 7. Receipts
 
 ```
-Key: receipts:{blockNum}
-Example: receipts:15000000
-Storage: Redis hash where keys are tx indices (0, 1, 2...)
+Key: receipts:{blockNum}:{txIndex}
+Example: receipts:15000000:0, receipts:15000000:1, receipts:15000000:2...
+Storage: Redis string (SET)
 ```
 
-Each receipt is stored as RLP-encoded binary data.
+Each receipt is stored as RLP-encoded binary data in its own key, with the transaction index included in the key.
 
 #### 8. Current Block Tracker
 
@@ -211,77 +205,103 @@ Response (JSON string):
 To get block information:
 
 ```
-HGETALL block:{blockNum}
+GET block:{blockNum}
 ```
 
 Example:
 
 ```
-HGETALL block:15000000
+GET block:15000000
+```
+
+Response:
+RLP-encoded binary data of the block header. This needs to be decoded using an RLP decoder to access individual fields.
+
+### Block Hash Mapping
+
+To get block number from hash:
+
+```
+GET blockHash:{blockHash}
+```
+
+Example:
+
+```
+GET blockHash:0x8f5bab218b6bb34476f51ca588e9f4553a3a7ce5e13a66c660a5283e97e9a85a
+```
+
+Response (JSON string):
+
+```
+{"number":15000000,"timestamp":1676392017}
+```
+
+### Transactions in a Block
+
+To get all transactions in a block, first get all transaction keys:
+
+```
+KEYS txs:{blockNum}:*
+```
+
+Example:
+
+```
+KEYS txs:15000000:*
 ```
 
 Response:
 
 ```
-1) "hash"
-2) "0x8f5bab218b6bb34476f51ca588e9f4553a3a7ce5e13a66c660a5283e97e9a85a"
-3) "parentHash"
-4) "0x61d05e8f9c448d998d4c862be75ed7dbe540e3f9a6e32838b286380a5ea68244"
-5) "stateRoot"
-6) "0xabc123..."
-7) "timestamp"
-8) "1676392017"
-9) "number"
-10) "15000000"
-```
-
-### Transactions in a Block
-
-To get all transactions in a block:
-
-```
-HGETALL txs:{blockNum}
-```
-
-Example:
-
-```
-HGETALL txs:15000000
-```
-
-Response (hash where keys are indices and values are RLP-encoded transactions):
-
-```
-1) "0"
-2) "{RLP encoded tx data}"
-3) "1"
-4) "{RLP encoded tx data}"
+1) "txs:15000000:0"
+2) "txs:15000000:1"
+3) "txs:15000000:2"
 ...
 ```
+
+Then get each transaction:
+
+```
+GET txs:15000000:0
+GET txs:15000000:1
+...
+```
+
+Each response contains RLP-encoded transaction data.
 
 ### Receipts in a Block
 
-To get all receipts in a block:
+To get all receipts in a block, first get all receipt keys:
 
 ```
-HGETALL receipts:{blockNum}
+KEYS receipts:{blockNum}:*
 ```
 
 Example:
 
 ```
-HGETALL receipts:15000000
+KEYS receipts:15000000:*
 ```
 
-Response (hash where keys are indices and values are RLP-encoded receipts):
+Response:
 
 ```
-1) "0"
-2) "{RLP encoded receipt data}"
-3) "1"
-4) "{RLP encoded receipt data}"
+1) "receipts:15000000:0"
+2) "receipts:15000000:1"
+3) "receipts:15000000:2"
 ...
 ```
+
+Then get each receipt:
+
+```
+GET receipts:15000000:0
+GET receipts:15000000:1
+...
+```
+
+Each response contains RLP-encoded receipt data.
 
 ### Contract Code
 
@@ -390,24 +410,39 @@ fmt.Printf("Storage value at block 1M: %s\n", storageValue)
 
 ```go
 // Get block information
-blockData, err := redisState.GetBlockByNumber(1000000)
+header, err := redisState.GetBlockByNumber(1000000)
 if err != nil {
     log.Fatal("Error getting block:", err)
 }
-fmt.Printf("Block hash: %s\n", blockData["hash"])
-fmt.Printf("Parent hash: %s\n", blockData["parentHash"])
+fmt.Printf("Block hash: %s\n", header.Hash().Hex())
+fmt.Printf("Parent hash: %s\n", header.ParentHash.Hex())
+fmt.Printf("State root: %s\n", header.Root.Hex())
+fmt.Printf("Timestamp: %d\n", header.Time)
 ```
 
 ### Get Transactions
 
 ```go
 // Get all transactions in a block
-txData, err := redisState.GetTransactionsByBlockNumber(1000000)
+txs, err := redisState.GetTransactionsByBlockNumber(1000000)
 if err != nil {
     log.Fatal("Error getting transactions:", err)
 }
-for idx, txRLP := range txData {
-    fmt.Printf("Transaction %s: %x...\n", idx, txRLP[:20])
+for i, tx := range txs {
+    fmt.Printf("Transaction %d hash: %s\n", i, tx.Hash().Hex())
+}
+```
+
+### Get Transaction Hashes
+
+```go
+// Get all transaction hashes in a block
+txHashes, err := redisState.GetTransactionHashesByBlockNumber(1000000)
+if err != nil {
+    log.Fatal("Error getting transaction hashes:", err)
+}
+for i, hash := range txHashes {
+    fmt.Printf("Transaction %d hash: %s\n", i, hash)
 }
 ```
 
