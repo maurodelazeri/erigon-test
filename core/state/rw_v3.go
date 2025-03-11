@@ -498,7 +498,10 @@ func (w *StateWriterV3) UpdateAccountData(address common.Address, original, acco
 		// Note: We're using a zero hash here as we don't have access to the block hash
 		// This is acceptable for this implementation as the main data lookup is by block number
 		var zeroHash libcommon.Hash
-		redisState.writeAccount(w.rs.domains.BlockNum(), zeroHash, address, account)
+		err := redisState.writeAccount(w.rs.domains.BlockNum(), zeroHash, address, account)
+		if err != nil {
+			return err
+		}
 	}
 
 	if err := w.rs.domains.DomainPut(kv.AccountsDomain, address[:], nil, value, nil, 0); err != nil {
@@ -515,7 +518,10 @@ func (w *StateWriterV3) UpdateAccountCode(address common.Address, incarnation ui
 	// Write to Redis if enabled
 	redisState := GetRedisState()
 	if redisState.Enabled() && len(code) > 0 {
-		redisState.writeCode(codeHash, code)
+		err := redisState.writeCode(codeHash, code)
+		if err != nil {
+			return err
+		}
 	}
 
 	if err := w.rs.domains.DomainPut(kv.CodeDomain, address[:], nil, code, nil, 0); err != nil {
@@ -537,7 +543,10 @@ func (w *StateWriterV3) DeleteAccount(address common.Address, original *accounts
 	if redisState.Enabled() && w.rs.domains != nil {
 		// Note: We're using a zero hash here as we don't have access to the block hash
 		var zeroHash libcommon.Hash
-		redisState.deleteAccount(w.rs.domains.BlockNum(), zeroHash, address)
+		err := redisState.deleteAccount(w.rs.domains.BlockNum(), zeroHash, address)
+		if err != nil {
+			return err
+		}
 	}
 
 	if err := w.rs.domains.DomainDel(kv.AccountsDomain, address[:], nil, nil, 0); err != nil {
@@ -564,7 +573,10 @@ func (w *StateWriterV3) WriteAccountStorage(address common.Address, incarnation 
 	if redisState.Enabled() && w.rs.domains != nil && key != nil {
 		// Note: We're using a zero hash here as we don't have access to the block hash
 		var zeroHash libcommon.Hash
-		redisState.writeStorage(w.rs.domains.BlockNum(), zeroHash, address, key, value)
+		err := redisState.writeStorage(w.rs.domains.BlockNum(), zeroHash, address, key, value)
+		if err != nil {
+			return err
+		}
 	}
 
 	if len(v) == 0 {

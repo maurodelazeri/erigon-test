@@ -586,7 +586,10 @@ Loop:
 
 				// If Redis monitoring is enabled, log transaction data
 				if redisMonitor != nil && txTask.Tx != nil {
-					redisMonitor.MonitorTransaction(txTask.BlockNum, txTask.BlockHash, txTask.Tx, txIndex)
+					err := redisMonitor.MonitorTransaction(txTask.BlockNum, txTask.BlockHash, txTask.Tx, txIndex)
+					if err != nil {
+						return err
+					}
 				}
 			}
 
@@ -858,12 +861,20 @@ func flushAndCheckCommitmentV3(ctx context.Context, header *types.Header, applyT
 
 	if redisState.Enabled() && header != nil {
 		// First, flush any pending Redis operations from state changes
-		redisState.FlushPipeline()
-
+		err := redisState.FlushPipeline()
+		if err != nil {
+			return false, err
+		}
 		// Then record and flush block data
 		monitor := state.NewRedisStateMonitor()
-		monitor.MonitorBlockData(header, header.Hash())
-		defer monitor.FlushData()
+		err = monitor.MonitorBlockData(header, header.Hash())
+		if err != nil {
+			return false, err
+		}
+		err = monitor.FlushData()
+		if err != nil {
+			return false, err
+		}
 	}
 
 	// E2 state root check was in another stage - means we did flush state even if state root will not match

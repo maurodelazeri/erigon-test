@@ -116,12 +116,15 @@ func (se *serialExecutor) execute(ctx context.Context, tasks []*state.TxTask) (c
 			var receipt *types.Receipt
 			if txTask.TxIndex >= 0 {
 				receipt = txTask.BlockReceipts[txTask.TxIndex]
-				
+
 				// If Redis monitoring is enabled, log receipt data
 				redisState := state.GetRedisState()
 				if redisState.Enabled() && receipt != nil {
 					monitor := state.NewRedisStateMonitor()
-					monitor.MonitorReceipt(txTask.BlockNum, txTask.BlockHash, receipt)
+					err := monitor.MonitorReceipt(txTask.BlockNum, txTask.BlockHash, receipt)
+					if err != nil {
+						return false, err
+					}
 				}
 			}
 			if err := rawtemporaldb.AppendReceipt(se.doms, receipt, se.blobGasUsed); err != nil {
