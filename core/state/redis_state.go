@@ -70,6 +70,28 @@ type AccountJSON struct {
 	Incarnation uint64 `json:"incarnation"`
 }
 
+// BlockJSON represents block metadata stored in Redis
+type BlockJSON struct {
+	Hash       string `json:"hash"`
+	ParentHash string `json:"parentHash"`
+	StateRoot  string `json:"stateRoot"`
+	Timestamp  uint64 `json:"timestamp"`
+	Number     uint64 `json:"number"`
+}
+
+// BlockHashJSON represents the block hash to block number mapping
+type BlockHashJSON struct {
+	Number    uint64 `json:"number"`
+	Timestamp uint64 `json:"timestamp"`
+}
+
+// ReorgJSON represents reorg metadata
+type ReorgJSON struct {
+	OldHash   string `json:"oldHash"`
+	NewHash   string `json:"newHash"`
+	Timestamp int64  `json:"timestamp"`
+}
+
 // Initialize creates or returns the global RedisState instance
 func InitRedisState(redisURL string, redisPassword string, logger log.Logger) *RedisState {
 	redisInitOnce.Do(func() {
@@ -271,7 +293,7 @@ func (rs *RedisState) AutoFlushPipeline() error {
 }
 
 // writeAccount writes account data to Redis
-func (rs *RedisState) writeAccount(blockNum uint64, blockHash libcommon.Hash, address libcommon.Address, account *accounts.Account) {
+func (rs *RedisState) writeAccount(blockNum uint64, _ libcommon.Hash, address libcommon.Address, account *accounts.Account) {
 	if !rs.enabled || account == nil {
 		return
 	}
@@ -307,7 +329,7 @@ func (rs *RedisState) writeAccount(blockNum uint64, blockHash libcommon.Hash, ad
 }
 
 // deleteAccount marks an account as deleted in Redis
-func (rs *RedisState) deleteAccount(blockNum uint64, blockHash libcommon.Hash, address libcommon.Address) {
+func (rs *RedisState) deleteAccount(blockNum uint64, _ libcommon.Hash, address libcommon.Address) {
 	if !rs.enabled {
 		return
 	}
@@ -350,8 +372,7 @@ func (rs *RedisState) writeCode(codeHash libcommon.Hash, code []byte) {
 }
 
 // writeStorage writes contract storage to Redis
-// writeStorage writes contract storage to Redis
-func (rs *RedisState) writeStorage(blockNum uint64, blockHash libcommon.Hash, address libcommon.Address, key *libcommon.Hash, value *uint256.Int) {
+func (rs *RedisState) writeStorage(blockNum uint64, _ libcommon.Hash, address libcommon.Address, key *libcommon.Hash, value *uint256.Int) {
 	if !rs.enabled {
 		return
 	}
@@ -392,23 +413,17 @@ func (rs *RedisState) writeBlock(block *types.Header, blockHash libcommon.Hash) 
 	blockNum := block.Number.Uint64()
 
 	rs.pipelineMutex.Lock()
-	// Set block data - indexed by block number
-	blockKey := fmt.Sprintf("%s%d", blockPrefix, blockNum)
-	rs.pipeline.HSet(rs.ctx, blockKey, map[string]interface{}{
-		"hash":       blockHash.Hex(),
-		"parentHash": block.ParentHash.Hex(),
-		"stateRoot":  block.Root.Hex(),
-		"timestamp":  block.Time,
-		"number":     blockNum,
-	})
-	rs.pipelineCount++
+	// Encode block header to binary
+	blockData, err := rlp.EncodeToBytes(block)
+	if err != nil {
+		rs.logger.Error("Failed to encode block", "blockHash", blockHash, "error", err)
+		rs.pipelineMutex.Unlock()
+		return
+	}
 
-	// Map hash to block number and metadata
-	hashKey := fmt.Sprintf("%s%s", blockHashPrefix, blockHash.Hex())
-	rs.pipeline.HSet(rs.ctx, hashKey, map[string]interface{}{
-		"number":    blockNum,
-		"timestamp": block.Time,
-	})
+	// Store encoded block header using a simple key-value pair
+	blockKey := fmt.Sprintf("%s%d", blockPrefix, blockNum)
+	rs.pipeline.Set(rs.ctx, blockKey, string(blockData), 0) // Never expires
 	rs.pipelineCount++
 	rs.pipelineMutex.Unlock()
 
@@ -419,7 +434,7 @@ func (rs *RedisState) writeBlock(block *types.Header, blockHash libcommon.Hash) 
 }
 
 // writeTx writes transaction data to Redis
-func (rs *RedisState) writeTx(blockNum uint64, blockHash libcommon.Hash, tx types.Transaction, txIndex int) {
+func (rs *RedisState) writeTx(blockNum uint64, _ libcommon.Hash, tx types.Transaction, txIndex int) {
 	if !rs.enabled {
 		return
 	}
@@ -436,9 +451,9 @@ func (rs *RedisState) writeTx(blockNum uint64, blockHash libcommon.Hash, tx type
 		return
 	}
 
-	// Store transaction directly in the block key
-	blockTxsKey := fmt.Sprintf("%s%d", txsPrefix, blockNum)
-	rs.pipeline.HSet(rs.ctx, blockTxsKey, fmt.Sprintf("%d", txIndex), string(txData))
+	// Store transaction with key that includes block and index
+	txKey := fmt.Sprintf("%s%d:%d", txsPrefix, blockNum, txIndex)
+	rs.pipeline.Set(rs.ctx, txKey, string(txData), 0) // Never expires
 	rs.pipelineCount++
 	rs.pipelineMutex.Unlock()
 
@@ -449,7 +464,7 @@ func (rs *RedisState) writeTx(blockNum uint64, blockHash libcommon.Hash, tx type
 }
 
 // writeReceipt writes receipt data to Redis
-func (rs *RedisState) writeReceipt(blockNum uint64, blockHash libcommon.Hash, receipt *types.Receipt) {
+func (rs *RedisState) writeReceipt(blockNum uint64, _ libcommon.Hash, receipt *types.Receipt) {
 	if !rs.enabled || receipt == nil {
 		return
 	}
@@ -463,9 +478,9 @@ func (rs *RedisState) writeReceipt(blockNum uint64, blockHash libcommon.Hash, re
 		return
 	}
 
-	// Store receipt directly in block-indexed hash
-	blockReceiptsKey := fmt.Sprintf("%s%d", receiptsPrefix, blockNum)
-	rs.pipeline.HSet(rs.ctx, blockReceiptsKey, fmt.Sprintf("%d", receipt.TransactionIndex), string(receiptData))
+	// Store receipt with key that includes block and index
+	receiptKey := fmt.Sprintf("%s%d:%d", receiptsPrefix, blockNum, receipt.TransactionIndex)
+	rs.pipeline.Set(rs.ctx, receiptKey, string(receiptData), 0) // Never expires
 	rs.pipelineCount++
 	rs.pipelineMutex.Unlock()
 
@@ -485,14 +500,25 @@ func (rs *RedisState) handleReorg(reorgFromBlock uint64, newCanonicalHash libcom
 
 	// Get old block hash
 	oldBlockKey := fmt.Sprintf("%s%d", blockPrefix, reorgFromBlock)
-	oldHash, err := rs.client.HGet(rs.ctx, oldBlockKey, "hash").Result()
+	oldBlockData, err := rs.client.Get(rs.ctx, oldBlockKey).Result()
+	var oldHash string
+
 	if err != nil {
 		if err == redis.Nil {
 			rs.logger.Warn("Block not found during reorg, proceeding anyway", "block", reorgFromBlock)
 			oldHash = ""
 		} else {
-			rs.logger.Error("Failed to get block hash during reorg", "block", reorgFromBlock, "error", err)
+			rs.logger.Error("Failed to get block data during reorg", "block", reorgFromBlock, "error", err)
 			return
+		}
+	} else {
+		// Parse the RLP encoded block to get its hash
+		var block types.Header
+		if err = rlp.DecodeBytes([]byte(oldBlockData), &block); err != nil {
+			rs.logger.Error("Failed to decode block during reorg", "block", reorgFromBlock, "error", err)
+			oldHash = ""
+		} else {
+			oldHash = block.Hash().Hex()
 		}
 	}
 
@@ -505,19 +531,37 @@ func (rs *RedisState) handleReorg(reorgFromBlock uint64, newCanonicalHash libcom
 	rs.pipelineMutex.Lock()
 
 	// Track reorg metadata
-	rs.pipeline.HSet(ctx, reorgKey, map[string]interface{}{
-		"oldHash":   oldHash,
-		"newHash":   newCanonicalHash.Hex(),
-		"timestamp": time.Now().Unix(),
-	})
+	reorgJSON := ReorgJSON{
+		OldHash:   oldHash,
+		NewHash:   newCanonicalHash.Hex(),
+		Timestamp: time.Now().Unix(),
+	}
+
+	reorgData, err := json.Marshal(reorgJSON)
+	if err != nil {
+		rs.logger.Error("Failed to marshal reorg data", "error", err)
+	} else {
+		rs.pipeline.Set(ctx, reorgKey, string(reorgData), 0)
+	}
 
 	// Delete all block data from reorgFromBlock and higher
 	for i := reorgFromBlock; i <= rs.currentBlock; i++ {
+		// Delete block
 		rs.pipeline.Del(ctx, fmt.Sprintf("%s%d", blockPrefix, i))
-		rs.pipeline.Del(ctx, fmt.Sprintf("%s%d", txsPrefix, i))
-		rs.pipeline.Del(ctx, fmt.Sprintf("%s%d", receiptsPrefix, i))
-		rs.pipeline.Del(ctx, fmt.Sprintf("%s%d:txs", blockPrefix, i))
-		rs.pipeline.Del(ctx, fmt.Sprintf("%s%d:receipts", blockPrefix, i))
+
+		// Find and delete transactions with this block number
+		txScanPattern := fmt.Sprintf("%s%d:*", txsPrefix, i)
+		txsToDelete, _ := rs.client.Keys(ctx, txScanPattern).Result()
+		for _, key := range txsToDelete {
+			rs.pipeline.Del(ctx, key)
+		}
+
+		// Find and delete receipts with this block number
+		receiptScanPattern := fmt.Sprintf("%s%d:*", receiptsPrefix, i)
+		receiptsToDelete, _ := rs.client.Keys(ctx, receiptScanPattern).Result()
+		for _, key := range receiptsToDelete {
+			rs.pipeline.Del(ctx, key)
+		}
 	}
 
 	// Delete the block hash entry
@@ -819,11 +863,10 @@ func (rs *RedisState) GetStorageAtBlock(address libcommon.Address, key libcommon
 	}
 
 	return storageState.Value, nil
-
 }
 
 // GetBlockByNumber gets block data by block number
-func (rs *RedisState) GetBlockByNumber(blockNum uint64) (map[string]string, error) {
+func (rs *RedisState) GetBlockByNumber(blockNum uint64) (*types.Header, error) {
 	if !rs.enabled {
 		return nil, fmt.Errorf("redis state not enabled")
 	}
@@ -834,21 +877,26 @@ func (rs *RedisState) GetBlockByNumber(blockNum uint64) (map[string]string, erro
 
 	// Get block data
 	blockKey := fmt.Sprintf("%s%d", blockPrefix, blockNum)
-	blockData, err := rs.client.HGetAll(ctx, blockKey).Result()
+	blockData, err := rs.client.Get(ctx, blockKey).Result()
 
 	if err != nil {
+		if err == redis.Nil {
+			return nil, fmt.Errorf("block %d not found", blockNum)
+		}
 		return nil, fmt.Errorf("block lookup failed: %v", err)
 	}
 
-	if len(blockData) == 0 {
-		return nil, fmt.Errorf("block %d not found", blockNum)
+	// Decode the block header
+	var header types.Header
+	if err := rlp.DecodeBytes([]byte(blockData), &header); err != nil {
+		return nil, fmt.Errorf("failed to decode block header: %v", err)
 	}
 
-	return blockData, nil
+	return &header, nil
 }
 
 // GetTransactionsByBlockNumber gets all transactions in a block
-func (rs *RedisState) GetTransactionsByBlockNumber(blockNum uint64) (map[string]string, error) {
+func (rs *RedisState) GetTransactionsByBlockNumber(blockNum uint64) ([]types.Transaction, error) {
 	if !rs.enabled {
 		return nil, fmt.Errorf("redis state not enabled")
 	}
@@ -857,15 +905,90 @@ func (rs *RedisState) GetTransactionsByBlockNumber(blockNum uint64) (map[string]
 	ctx, cancel := context.WithTimeout(rs.ctx, 5*time.Second)
 	defer cancel()
 
-	// Get transaction data
-	txKey := fmt.Sprintf("%s%d", txsPrefix, blockNum)
-	txData, err := rs.client.HGetAll(ctx, txKey).Result()
-
+	// Find all tx keys for this block
+	txKeys, err := rs.client.Keys(ctx, fmt.Sprintf("%s%d:*", txsPrefix, blockNum)).Result()
 	if err != nil {
-		return nil, fmt.Errorf("transaction lookup failed: %v", err)
+		return nil, fmt.Errorf("transaction key lookup failed: %v", err)
 	}
 
-	return txData, nil
+	if len(txKeys) == 0 {
+		return []types.Transaction{}, nil
+	}
+
+	// Create sorted array of transactions
+	txs := make([]types.Transaction, len(txKeys))
+	var wg sync.WaitGroup
+	var errMutex sync.Mutex
+	var firstErr error
+
+	for _, key := range txKeys {
+		wg.Add(1)
+		go func(txKey string) {
+			defer wg.Add(-1)
+
+			// Extract index from key pattern txs:BLOCK:INDEX
+			parts := strings.Split(txKey, ":")
+			if len(parts) != 3 {
+				errMutex.Lock()
+				if firstErr == nil {
+					firstErr = fmt.Errorf("invalid transaction key format: %s", txKey)
+				}
+				errMutex.Unlock()
+				return
+			}
+
+			idxStr := parts[2]
+			idx, err := strconv.Atoi(idxStr)
+			if err != nil {
+				errMutex.Lock()
+				if firstErr == nil {
+					firstErr = fmt.Errorf("invalid transaction index in key: %s", txKey)
+				}
+				errMutex.Unlock()
+				return
+			}
+
+			// Get transaction data
+			txData, err := rs.client.Get(ctx, txKey).Bytes()
+			if err != nil {
+				errMutex.Lock()
+				if firstErr == nil {
+					firstErr = fmt.Errorf("failed to get transaction data: %v", err)
+				}
+				errMutex.Unlock()
+				return
+			}
+
+			// Decode transaction
+			var tx types.Transaction
+			if err := rlp.DecodeBytes(txData, &tx); err != nil {
+				errMutex.Lock()
+				if firstErr == nil {
+					firstErr = fmt.Errorf("failed to decode transaction: %v", err)
+				}
+				errMutex.Unlock()
+				return
+			}
+
+			if idx < len(txs) {
+				txs[idx] = tx
+			} else {
+				errMutex.Lock()
+				if firstErr == nil {
+					firstErr = fmt.Errorf("transaction index out of range: %d", idx)
+				}
+				errMutex.Unlock()
+			}
+		}(key)
+	}
+
+	wg.Wait()
+
+	if firstErr != nil {
+		return nil, firstErr
+	}
+
+	return txs, nil
 }
 
 // GetTransactionHashesByBlockNumber gets all transaction hashes in a block
@@ -878,19 +1001,66 @@ func (rs *RedisState) GetTransactionHashesByBlockNumber(blockNum uint64) ([]stri
 	ctx, cancel := context.WithTimeout(rs.ctx, 5*time.Second)
 	defer cancel()
 
-	// Get transaction hashes
-	txHashesKey := fmt.Sprintf("%s%d:txs", blockPrefix, blockNum)
-	txHashes, err := rs.client.SMembers(ctx, txHashesKey).Result()
-
+	// Find all tx keys for this block
+	txKeys, err := rs.client.Keys(ctx, fmt.Sprintf("%s%d:*", txsPrefix, blockNum)).Result()
 	if err != nil {
-		return nil, fmt.Errorf("transaction hashes lookup failed: %v", err)
+		return nil, fmt.Errorf("transaction key lookup failed: %v", err)
+	}
+
+	if len(txKeys) == 0 {
+		return []string{}, nil
+	}
+
+	// Get and decode all transactions
+	txHashes := make([]string, 0, len(txKeys))
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var firstErr error
+
+	for _, key := range txKeys {
+		wg.Add(1)
+		go func(txKey string) {
+			defer wg.Add(-1)
+
+			// Get transaction data
+			txData, err := rs.client.Get(ctx, txKey).Bytes()
+			if err != nil {
+				mu.Lock()
+				if firstErr == nil {
+					firstErr = fmt.Errorf("failed to get transaction data: %v", err)
+				}
+				mu.Unlock()
+				return
+			}
+
+			// Decode enough of transaction to get hash
+			var tx types.Transaction
+			if err := rlp.DecodeBytes(txData, &tx); err != nil {
+				mu.Lock()
+				if firstErr == nil {
+					firstErr = fmt.Errorf("failed to decode transaction: %v", err)
+				}
+				mu.Unlock()
+				return
+			}
+
+			mu.Lock()
+			txHashes = append(txHashes, tx.Hash().Hex())
+			mu.Unlock()
+		}(key)
+	}
+
+	wg.Wait()
+
+	if firstErr != nil {
+		return nil, firstErr
 	}
 
 	return txHashes, nil
 }
 
 // GetReceiptsByBlockNumber gets all receipts in a block
-func (rs *RedisState) GetReceiptsByBlockNumber(blockNum uint64) (map[string]string, error) {
+func (rs *RedisState) GetReceiptsByBlockNumber(blockNum uint64) ([]*types.Receipt, error) {
 	if !rs.enabled {
 		return nil, fmt.Errorf("redis state not enabled")
 	}
@@ -899,15 +1069,90 @@ func (rs *RedisState) GetReceiptsByBlockNumber(blockNum uint64) (map[string]stri
 	ctx, cancel := context.WithTimeout(rs.ctx, 5*time.Second)
 	defer cancel()
 
-	// Get receipt data
-	receiptKey := fmt.Sprintf("%s%d", receiptsPrefix, blockNum)
-	receiptData, err := rs.client.HGetAll(ctx, receiptKey).Result()
-
+	// Find all receipt keys for this block
+	receiptKeys, err := rs.client.Keys(ctx, fmt.Sprintf("%s%d:*", receiptsPrefix, blockNum)).Result()
 	if err != nil {
-		return nil, fmt.Errorf("receipt lookup failed: %v", err)
+		return nil, fmt.Errorf("receipt key lookup failed: %v", err)
 	}
 
-	return receiptData, nil
+	if len(receiptKeys) == 0 {
+		return []*types.Receipt{}, nil
+	}
+
+	// Create sorted array of receipts
+	receipts := make([]*types.Receipt, len(receiptKeys))
+	var wg sync.WaitGroup
+	var errMutex sync.Mutex
+	var firstErr error
+
+	for _, key := range receiptKeys {
+		wg.Add(1)
+		go func(receiptKey string) {
+			defer wg.Add(-1)
+
+			// Extract index from key pattern receipts:BLOCK:INDEX
+			parts := strings.Split(receiptKey, ":")
+			if len(parts) != 3 {
+				errMutex.Lock()
+				if firstErr == nil {
+					firstErr = fmt.Errorf("invalid receipt key format: %s", receiptKey)
+				}
+				errMutex.Unlock()
+				return
+			}
+
+			idxStr := parts[2]
+			idx, err := strconv.Atoi(idxStr)
+			if err != nil {
+				errMutex.Lock()
+				if firstErr == nil {
+					firstErr = fmt.Errorf("invalid receipt index in key: %s", receiptKey)
+				}
+				errMutex.Unlock()
+				return
+			}
+
+			// Get receipt data
+			receiptData, err := rs.client.Get(ctx, receiptKey).Bytes()
+			if err != nil {
+				errMutex.Lock()
+				if firstErr == nil {
+					firstErr = fmt.Errorf("failed to get receipt data: %v", err)
+				}
+				errMutex.Unlock()
+				return
+			}
+
+			// Decode receipt
+			var receipt types.Receipt
+			if err := rlp.DecodeBytes(receiptData, &receipt); err != nil {
+				errMutex.Lock()
+				if firstErr == nil {
+					firstErr = fmt.Errorf("failed to decode receipt: %v", err)
+				}
+				errMutex.Unlock()
+				return
+			}
+
+			if idx < len(receipts) {
+				receipts[idx] = &receipt
+			} else {
+				errMutex.Lock()
+				if firstErr == nil {
+					firstErr = fmt.Errorf("receipt index out of range: %d", idx)
+				}
+				errMutex.Unlock()
+			}
+		}(key)
+	}
+
+	wg.Wait()
+
+	if firstErr != nil {
+		return nil, firstErr
+	}
+
+	return receipts, nil
 }
 
 // GetCode gets contract code by code hash
