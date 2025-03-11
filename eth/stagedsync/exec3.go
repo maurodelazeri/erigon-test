@@ -490,6 +490,13 @@ Loop:
 		inputBlockNum.Store(blockNum)
 		executor.domains().SetBlockNum(blockNum)
 
+		// Call MonitorBlockProcessing if Redis state shadowing is enabled
+		if redisMonitor != nil {
+			if err := redisMonitor.MonitorBlockProcessing(blockNum); err != nil {
+				return err
+			}
+		}
+
 		b, err = blockWithSenders(ctx, cfg.db, executor.tx(), blockReader, blockNum)
 		if err != nil {
 			return err
@@ -844,6 +851,17 @@ func handleIncorrectRootHashError(header *types.Header, applyTx kv.RwTx, cfg Exe
 		return false, fmt.Errorf("%w: requested=%d, minAllowed=%d", ErrTooDeepUnwind, unwindTo, allowedUnwindTo)
 	}
 	logger.Warn("Unwinding due to incorrect root hash", "to", unwindTo)
+
+	// Handle Redis state cleanup during unwind if enabled
+	redisState := state.GetRedisState()
+	if redisState.Enabled() {
+		redisMonitor := state.NewRedisStateMonitor()
+		if err := redisMonitor.MonitorUnwind(applyTx, allowedUnwindTo); err != nil {
+			logger.Error("Failed to handle Redis state during unwind", "error", err)
+			// Continue with unwind even if Redis fails
+		}
+	}
+
 	if u != nil {
 		if err := u.UnwindTo(allowedUnwindTo, BadBlock(header.Hash(), ErrInvalidStateRootHash), applyTx); err != nil {
 			return false, err
