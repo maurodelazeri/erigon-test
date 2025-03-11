@@ -183,15 +183,15 @@ func (api *DebugAPI) traceBlock(ctx context.Context, blockNrOrHash rpc.BlockNumb
 	for txIndex, tx := range txs {
 		// Create basic transaction data map
 		txData := map[string]interface{}{
-			"hash":   tx.Hash().Hex(),
-			"from":   "0x0000000000000000000000000000000000000000", // Would need to recover sender
+			"hash": tx.Hash().Hex(),
+			"from": "0x0000000000000000000000000000000000000000", // Would need to recover sender
 		}
-		
+
 		// Add other transaction fields
 		if to := tx.GetTo(); to != nil {
 			txData["to"] = to.Hex()
 		}
-		
+
 		txData["value"] = tx.GetValue().Hex()
 		txData["gas"] = hexutil.EncodeUint64(tx.GetGas())
 		txData["gasPrice"] = tx.GetPrice().Hex()

@@ -437,33 +437,12 @@ func (r *RedisStateProvider) GetBlockByNumber(ctx context.Context, blockNumber r
 	if fullTx {
 		txs, err := r.GetTransactionsByBlockNumber(ctx, blockNum)
 		if err == nil && len(txs) > 0 {
-			txArray := make([]interface{}, 0, len(txs))
-			// Parse and add transactions
-			for i, tx := range txs {
-				// This would decode the transaction in a full implementation
-				// Here, we're just creating a placeholder
-				txObj := map[string]interface{}{
-					"hash":             tx.Hash().Hex(),
-					"blockHash":        header.Hash().Hex(),
-					"blockNumber":      blockInfo["number"],
-					"transactionIndex": hexutil.EncodeUint64(uint64(i)),
-					"from":             "0x0000000000000000000000000000000000000000", // Would need to recover sender
-				}
-				
-				// Add "to" if not contract creation
-				if to := tx.GetTo(); to != nil {
-					txObj["to"] = to.Hex()
-				}
-				
-				// Add other tx fields
-				txObj["value"] = (*hexutil.Big)(tx.GetValue().ToBig())
-				txObj["gas"] = hexutil.EncodeUint64(tx.GetGas())
-				txObj["gasPrice"] = (*hexutil.Big)(tx.GetPrice().ToBig())
-				txObj["input"] = "0x" + libcommon.Bytes2Hex(tx.GetData())
-				txObj["nonce"] = hexutil.EncodeUint64(tx.GetNonce())
-				txArray = append(txArray, txObj)
+			txs, err := r.GetTransactionsByBlockNumber(ctx, blockNum)
+			if err == nil && len(txs) > 0 {
+				blockInfo["transactions"] = txs
+			} else {
+				blockInfo["transactions"] = []interface{}{}
 			}
-			blockInfo["transactions"] = txArray
 		} else {
 			blockInfo["transactions"] = []interface{}{}
 		}
