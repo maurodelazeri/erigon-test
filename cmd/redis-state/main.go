@@ -421,7 +421,7 @@ func (r *RedisStateProvider) GetBlockByNumber(ctx context.Context, blockNumber r
 	// Add additional fields
 	blockInfo["nonce"] = hexutil.EncodeUint64(header.Nonce.Uint64())
 	blockInfo["difficulty"] = (*hexutil.Big)(header.Difficulty)
-	blockInfo["extraData"] = hexutil.Encode(header.Extra)
+	blockInfo["extraData"] = "0x" + libcommon.Bytes2Hex(header.Extra)
 	blockInfo["size"] = hexutil.EncodeUint64(uint64(len(blockData)))
 	blockInfo["gasLimit"] = hexutil.EncodeUint64(header.GasLimit)
 	blockInfo["gasUsed"] = hexutil.EncodeUint64(header.GasUsed)
@@ -448,13 +448,19 @@ func (r *RedisStateProvider) GetBlockByNumber(ctx context.Context, blockNumber r
 					"blockNumber":      blockInfo["number"],
 					"transactionIndex": hexutil.EncodeUint64(uint64(i)),
 					"from":             "0x0000000000000000000000000000000000000000", // Would need to recover sender
-					"to":               tx.To().Hex(),                                // If contract creation, would be null
-					"value":            (*hexutil.Big)(tx.Value().ToBig()),
-					"gas":              hexutil.EncodeUint64(tx.Gas()),
-					"gasPrice":         (*hexutil.Big)(tx.GasPrice().ToBig()),
-					"input":            hexutil.Encode(tx.Data()),
-					"nonce":            hexutil.EncodeUint64(tx.Nonce()),
 				}
+				
+				// Add "to" if not contract creation
+				if to := tx.GetTo(); to != nil {
+					txObj["to"] = to.Hex()
+				}
+				
+				// Add other tx fields
+				txObj["value"] = (*hexutil.Big)(tx.GetValue().ToBig())
+				txObj["gas"] = hexutil.EncodeUint64(tx.GetGas())
+				txObj["gasPrice"] = (*hexutil.Big)(tx.GetPrice().ToBig())
+				txObj["input"] = "0x" + libcommon.Bytes2Hex(tx.GetData())
+				txObj["nonce"] = hexutil.EncodeUint64(tx.GetNonce())
 				txArray = append(txArray, txObj)
 			}
 			blockInfo["transactions"] = txArray

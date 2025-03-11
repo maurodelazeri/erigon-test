@@ -195,7 +195,7 @@ func (api *DebugAPI) traceBlock(ctx context.Context, blockNrOrHash rpc.BlockNumb
 		txData["value"] = tx.GetValue().Hex()
 		txData["gas"] = hexutil.EncodeUint64(tx.GetGas())
 		txData["gasPrice"] = tx.GetPrice().Hex()
-		txData["input"] = hexutil.Encode(tx.GetData())
+		txData["input"] = "0x" + common.Bytes2Hex(tx.GetData())
 		txData["nonce"] = hexutil.EncodeUint64(tx.GetNonce())
 
 		stream.WriteObjectStart()
