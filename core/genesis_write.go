@@ -557,7 +557,10 @@ func GenesisToBlock(g *types.Genesis, dirs datadir.Dirs, logger log.Logger) (*ty
 		defer sd.Close()
 
 		//r, w := state.NewDbStateReader(tx), state.NewDbStateWriter(tx, 0)
-		r, w := state.NewReaderV3(sd), state.NewWriterV4(sd)
+		r := state.NewReaderV3(sd)
+			baseWriter := state.NewWriterV4(sd)
+			// Use Redis-enabled writer if Redis state is enabled
+			w := state.WrapStateWriter(baseWriter, 0, head.Hash())
 		statedb = state.New(r)
 		statedb.SetTrace(false)
 
