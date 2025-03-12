@@ -24,70 +24,36 @@ func NewRedisStateMonitor() *RedisStateMonitor {
 
 // MonitorBlockProcessing records a new block being processed in Redis
 func (rm *RedisStateMonitor) MonitorBlockProcessing(blockNum uint64) error {
-	if !rm.redis.Enabled() {
-		return nil
-	}
-	err := rm.redis.beginBlockProcessing(blockNum)
-	if err != nil {
-		return err
-	}
-	return nil
+	// Redis errors are propagated to ensure synchronization
+	return rm.redis.beginBlockProcessing(blockNum)
 }
 
 // MonitorBlockData records block data in Redis
 func (rm *RedisStateMonitor) MonitorBlockData(header *types.Header, blockHash libcommon.Hash) error {
-	if !rm.redis.Enabled() {
-		return nil
-	}
-	err := rm.redis.writeBlock(header, blockHash)
-	if err != nil {
-		return err
-	}
-	return nil
+	// Redis errors are propagated to ensure synchronization
+	return rm.redis.writeBlock(header, blockHash)
 }
 
 // MonitorTransaction records transaction data in Redis
 func (rm *RedisStateMonitor) MonitorTransaction(blockNum uint64, blockHash libcommon.Hash, tx types.Transaction, txIndex int) error {
-	if !rm.redis.Enabled() {
-		return nil
-	}
-	err := rm.redis.writeTx(blockNum, blockHash, tx, txIndex)
-	if err != nil {
-		return err
-	}
-	return nil
+	// Redis errors are propagated to ensure synchronization
+	return rm.redis.writeTx(blockNum, blockHash, tx, txIndex)
 }
 
 // MonitorReceipt records receipt data in Redis
 func (rm *RedisStateMonitor) MonitorReceipt(blockNum uint64, blockHash libcommon.Hash, receipt *types.Receipt) error {
-	if !rm.redis.Enabled() {
-		return nil
-	}
-	err := rm.redis.writeReceipt(blockNum, blockHash, receipt)
-	if err != nil {
-		return err
-	}
-	return nil
+	// Redis errors are propagated to ensure synchronization
+	return rm.redis.writeReceipt(blockNum, blockHash, receipt)
 }
 
 // FlushData ensures all data is written to Redis
 func (rm *RedisStateMonitor) FlushData() error {
-	if !rm.redis.Enabled() {
-		return nil
-	}
-	err := rm.redis.FlushPipeline()
-	if err != nil {
-		return err
-	}
-	return nil
+	// Redis errors are propagated to ensure synchronization
+	return rm.redis.FlushPipeline()
 }
 
 // MonitorUnwind handles Redis data cleanup during chain reorganization
 func (rm *RedisStateMonitor) MonitorUnwind(tx kv.RwTx, blockUnwindTo uint64) error {
-	if !rm.redis.Enabled() {
-		return nil
-	}
-
 	// First get the new canonical block hash (the one we're rewinding to)
 	newCanonicalBlock, err := tx.GetOne(kv.HeaderCanonical, dbutils.EncodeBlockNumber(blockUnwindTo))
 	if err != nil {
@@ -101,8 +67,6 @@ func (rm *RedisStateMonitor) MonitorUnwind(tx kv.RwTx, blockUnwindTo uint64) err
 		newCanonicalHash = libcommon.BytesToHash(newCanonicalBlock)
 	}
 
-	// Handle reorganization in Redis
+	// Handle reorganization in Redis - errors are propagated to ensure synchronization
 	return rm.redis.handleReorg(blockUnwindTo+1, newCanonicalHash)
 }
-
-// All other methods are automatically provided by the embedded StateV3

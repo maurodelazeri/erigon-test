@@ -883,12 +883,14 @@ func flushAndCheckCommitmentV3(ctx context.Context, header *types.Header, applyT
 		if err != nil {
 			return false, err
 		}
+
 		// Then record and flush block data
 		monitor := state.NewRedisStateMonitor()
 		err = monitor.MonitorBlockData(header, header.Hash())
 		if err != nil {
 			return false, err
 		}
+
 		err = monitor.FlushData()
 		if err != nil {
 			return false, err

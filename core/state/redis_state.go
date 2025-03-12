@@ -31,15 +31,16 @@ const (
 	reorgPrefix     = "reorg:"
 
 	// Timeouts
-	redisConnectTimeout = 5 * time.Second
-	redisReorgTimeout   = 5 * time.Minute
-	redisBatchTimeout   = 30 * time.Second
+	redisConnectTimeout   = 5 * time.Second
+	redisOperationTimeout = 15 * time.Second // Increased timeout
+	redisReorgTimeout     = 5 * time.Minute
+	redisBatchTimeout     = 30 * time.Second
 
 	// Batch sizes
 	redisReorgBatchSize = 100
 
 	// Maximum number of commands to queue before flushing
-	maxPipelineSize = 5000
+	maxPipelineSize = 1000 // Reduced from 5000
 )
 
 // RedisState handles persisting blockchain state to Redis
@@ -126,6 +127,10 @@ func InitRedisState(redisURL string, redisPassword string, logger log.Logger) *R
 		opts.PoolSize = 20 // Increase connection pool size for better concurrency
 		opts.MinIdleConns = 5
 		opts.MaxRetries = 3
+		opts.ReadTimeout = redisOperationTimeout
+		opts.WriteTimeout = redisOperationTimeout
+		opts.DialTimeout = redisConnectTimeout
+		opts.PoolTimeout = redisOperationTimeout * 2
 
 		client := redis.NewClient(opts)
 
@@ -229,7 +234,7 @@ func (rs *RedisState) Close() error {
 // beginBlockProcessing starts block processing in Redis
 func (rs *RedisState) beginBlockProcessing(blockNum uint64) error {
 	if !rs.enabled {
-		return fmt.Errorf("Redis state is disabled")
+		return nil
 	}
 
 	rs.blockMutex.Lock()
@@ -245,8 +250,8 @@ func (rs *RedisState) beginBlockProcessing(blockNum uint64) error {
 
 		// Auto-flush if needed
 		if err := rs.AutoFlushPipeline(); err != nil {
-			rs.logger.Error("Error auto-flushing pipeline", "error", err)
-			return err
+			rs.logger.Error("Failed to update block processing state in Redis", "block", blockNum, "error", err)
+			return fmt.Errorf("redis error in beginBlockProcessing: %w", err)
 		}
 	}
 
@@ -257,7 +262,7 @@ func (rs *RedisState) beginBlockProcessing(blockNum uint64) error {
 // This is exported to allow explicit flushing at commit points
 func (rs *RedisState) FlushPipeline() error {
 	if !rs.enabled {
-		return fmt.Errorf("Redis state is disabled")
+		return nil
 	}
 
 	rs.pipelineMutex.Lock()
@@ -268,13 +273,17 @@ func (rs *RedisState) FlushPipeline() error {
 		return nil
 	}
 
-	_, err := rs.pipeline.Exec(rs.ctx)
+	ctx, cancel := context.WithTimeout(rs.ctx, redisOperationTimeout)
+	defer cancel()
+
+	rs.logger.Debug("Flushing Redis pipeline", "commands", rs.pipelineCount)
+	_, err := rs.pipeline.Exec(ctx)
 	if err != nil {
 		rs.logger.Error("Failed to execute Redis pipeline", "error", err, "commands", rs.pipelineCount)
-		// Create a new pipeline
+		// Create a new pipeline even on error
 		rs.pipeline = rs.client.Pipeline()
 		rs.pipelineCount = 0
-		return err
+		return fmt.Errorf("redis pipeline execution error: %w", err)
 	}
 
 	// Create a new pipeline
@@ -295,13 +304,9 @@ func (rs *RedisState) AutoFlushPipeline() error {
 }
 
 // writeAccount writes account data to Redis
-func (rs *RedisState) writeAccount(blockNum uint64, _ libcommon.Hash, address libcommon.Address, account *accounts.Account) error {
-	if account == nil {
+func (rs *RedisState) writeAccount(blockNum uint64, blockHash libcommon.Hash, address libcommon.Address, account *accounts.Account) error {
+	if account == nil || !rs.enabled {
 		return nil
-	}
-
-	if !rs.enabled {
-		return fmt.Errorf("Redis state is disabled")
 	}
 
 	rs.logger.Debug("Writing account to Redis", "address", address.Hex(), "nonce", account.Nonce, "balance", account.Balance.ToBig().String(), "block", blockNum)
@@ -316,7 +321,7 @@ func (rs *RedisState) writeAccount(blockNum uint64, _ libcommon.Hash, address li
 	jsonData, err := json.Marshal(accountJSON)
 	if err != nil {
 		rs.logger.Error("Failed to marshal account data", "address", address, "error", err)
-		return err
+		return fmt.Errorf("failed to marshal account data for Redis: %w", err)
 	}
 
 	rs.pipelineMutex.Lock()
@@ -330,17 +335,16 @@ func (rs *RedisState) writeAccount(blockNum uint64, _ libcommon.Hash, address li
 
 	// Auto-flush if needed
 	if err := rs.AutoFlushPipeline(); err != nil {
-		rs.logger.Error("Error auto-flushing pipeline", "error", err)
-		return err
+		return fmt.Errorf("failed to flush account data to Redis: %w", err)
 	}
 
 	return nil
 }
 
 // deleteAccount marks an account as deleted in Redis
-func (rs *RedisState) deleteAccount(blockNum uint64, _ libcommon.Hash, address libcommon.Address) error {
+func (rs *RedisState) deleteAccount(blockNum uint64, blockHash libcommon.Hash, address libcommon.Address) error {
 	if !rs.enabled {
-		return fmt.Errorf("Redis state is disabled")
+		return nil
 	}
 
 	rs.pipelineMutex.Lock()
@@ -357,8 +361,7 @@ func (rs *RedisState) deleteAccount(blockNum uint64, _ libcommon.Hash, address l
 
 	// Auto-flush if needed
 	if err := rs.AutoFlushPipeline(); err != nil {
-		rs.logger.Error("Error auto-flushing pipeline", "error", err)
-		return err
+		return fmt.Errorf("failed to flush account deletion to Redis: %w", err)
 	}
 
 	return nil
@@ -366,12 +369,8 @@ func (rs *RedisState) deleteAccount(blockNum uint64, _ libcommon.Hash, address l
 
 // writeCode writes contract code to Redis
 func (rs *RedisState) writeCode(codeHash libcommon.Hash, code []byte) error {
-	if len(code) == 0 {
+	if len(code) == 0 || !rs.enabled {
 		return nil
-	}
-
-	if !rs.enabled {
-		return fmt.Errorf("Redis state is disabled")
 	}
 
 	rs.pipelineMutex.Lock()
@@ -383,17 +382,16 @@ func (rs *RedisState) writeCode(codeHash libcommon.Hash, code []byte) error {
 
 	// Auto-flush if needed
 	if err := rs.AutoFlushPipeline(); err != nil {
-		rs.logger.Error("Error auto-flushing pipeline", "error", err)
-		return err
+		return fmt.Errorf("failed to flush code to Redis: %w", err)
 	}
 
 	return nil
 }
 
 // writeStorage writes contract storage to Redis
-func (rs *RedisState) writeStorage(blockNum uint64, _ libcommon.Hash, address libcommon.Address, key *libcommon.Hash, value *uint256.Int) error {
+func (rs *RedisState) writeStorage(blockNum uint64, blockHash libcommon.Hash, address libcommon.Address, key *libcommon.Hash, value *uint256.Int) error {
 	if !rs.enabled {
-		return fmt.Errorf("Redis state is disabled")
+		return nil
 	}
 
 	rs.pipelineMutex.Lock()
@@ -419,8 +417,7 @@ func (rs *RedisState) writeStorage(blockNum uint64, _ libcommon.Hash, address li
 
 	// Auto-flush if needed
 	if err := rs.AutoFlushPipeline(); err != nil {
-		rs.logger.Error("Error auto-flushing pipeline", "error", err)
-		return err
+		return fmt.Errorf("failed to flush storage to Redis: %w", err)
 	}
 
 	return nil
@@ -428,12 +425,8 @@ func (rs *RedisState) writeStorage(blockNum uint64, _ libcommon.Hash, address li
 
 // writeBlock writes block data to Redis
 func (rs *RedisState) writeBlock(block *types.Header, blockHash libcommon.Hash) error {
-	if block == nil {
+	if block == nil || !rs.enabled {
 		return nil
-	}
-
-	if !rs.enabled {
-		return fmt.Errorf("Redis state is disabled")
 	}
 
 	blockNum := block.Number.Uint64()
@@ -442,9 +435,9 @@ func (rs *RedisState) writeBlock(block *types.Header, blockHash libcommon.Hash) 
 	// Encode block header to binary
 	blockData, err := rlp.EncodeToBytes(block)
 	if err != nil {
-		rs.logger.Error("Failed to encode block", "blockHash", blockHash, "error", err)
 		rs.pipelineMutex.Unlock()
-		return err
+		rs.logger.Error("Failed to encode block", "blockHash", blockHash, "error", err)
+		return fmt.Errorf("failed to encode block for Redis: %w", err)
 	}
 
 	// Store encoded block header using a simple key-value pair
@@ -455,17 +448,16 @@ func (rs *RedisState) writeBlock(block *types.Header, blockHash libcommon.Hash) 
 
 	// Auto-flush if needed
 	if err := rs.AutoFlushPipeline(); err != nil {
-		rs.logger.Error("Error auto-flushing pipeline", "error", err)
-		return err
+		return fmt.Errorf("failed to flush block data to Redis: %w", err)
 	}
 
 	return nil
 }
 
 // writeTx writes transaction data to Redis
-func (rs *RedisState) writeTx(blockNum uint64, _ libcommon.Hash, tx types.Transaction, txIndex int) error {
+func (rs *RedisState) writeTx(blockNum uint64, blockHash libcommon.Hash, tx types.Transaction, txIndex int) error {
 	if !rs.enabled {
-		return fmt.Errorf("Redis state is disabled")
+		return nil
 	}
 
 	// Get tx hash
@@ -475,9 +467,9 @@ func (rs *RedisState) writeTx(blockNum uint64, _ libcommon.Hash, tx types.Transa
 	// Store transaction data in Redis
 	txData, err := rlp.EncodeToBytes(tx)
 	if err != nil {
-		rs.logger.Error("Failed to encode transaction", "hash", txHash, "error", err)
 		rs.pipelineMutex.Unlock()
-		return err
+		rs.logger.Error("Failed to encode transaction", "hash", txHash, "error", err)
+		return fmt.Errorf("failed to encode transaction for Redis: %w", err)
 	}
 
 	// Store transaction with key that includes block and index
@@ -488,30 +480,25 @@ func (rs *RedisState) writeTx(blockNum uint64, _ libcommon.Hash, tx types.Transa
 
 	// Auto-flush if needed
 	if err := rs.AutoFlushPipeline(); err != nil {
-		rs.logger.Error("Error auto-flushing pipeline", "error", err)
-		return err
+		return fmt.Errorf("failed to flush transaction to Redis: %w", err)
 	}
 
 	return nil
 }
 
 // writeReceipt writes receipt data to Redis
-func (rs *RedisState) writeReceipt(blockNum uint64, _ libcommon.Hash, receipt *types.Receipt) error {
-	if receipt == nil {
+func (rs *RedisState) writeReceipt(blockNum uint64, blockHash libcommon.Hash, receipt *types.Receipt) error {
+	if receipt == nil || !rs.enabled {
 		return nil
-	}
-
-	if !rs.enabled {
-		return fmt.Errorf("Redis state is disabled")
 	}
 
 	rs.pipelineMutex.Lock()
 	// Encode receipt to binary
 	receiptData, err := rlp.EncodeToBytes(receipt)
 	if err != nil {
-		rs.logger.Error("Failed to encode receipt", "hash", receipt.TxHash, "error", err)
 		rs.pipelineMutex.Unlock()
-		return err
+		rs.logger.Error("Failed to encode receipt", "hash", receipt.TxHash, "error", err)
+		return fmt.Errorf("failed to encode receipt for Redis: %w", err)
 	}
 
 	// Store receipt with key that includes block and index
@@ -522,8 +509,7 @@ func (rs *RedisState) writeReceipt(blockNum uint64, _ libcommon.Hash, receipt *t
 
 	// Auto-flush if needed
 	if err := rs.AutoFlushPipeline(); err != nil {
-		rs.logger.Error("Error auto-flushing pipeline", "error", err)
-		return err
+		return fmt.Errorf("failed to flush receipt to Redis: %w", err)
 	}
 
 	return nil
@@ -532,14 +518,18 @@ func (rs *RedisState) writeReceipt(blockNum uint64, _ libcommon.Hash, receipt *t
 // handleReorg handles chain reorganization in Redis with a focus on reliability
 func (rs *RedisState) handleReorg(reorgFromBlock uint64, newCanonicalHash libcommon.Hash) error {
 	if !rs.enabled {
-		return fmt.Errorf("redis state is disabled")
+		return nil
 	}
 
 	rs.logger.Info("Handling chain reorganization", "fromBlock", reorgFromBlock, "newCanonicalHash", newCanonicalHash.Hex())
 
+	// Create a context with timeout for the operation to fetch old block hash
+	ctx, cancel := context.WithTimeout(rs.ctx, redisOperationTimeout)
+	defer cancel()
+
 	// Get old block hash
 	oldBlockKey := fmt.Sprintf("%s%d", blockPrefix, reorgFromBlock)
-	oldBlockData, err := rs.client.Get(rs.ctx, oldBlockKey).Result()
+	oldBlockData, err := rs.client.Get(ctx, oldBlockKey).Result()
 	var oldHash string
 
 	if err != nil {
@@ -548,7 +538,7 @@ func (rs *RedisState) handleReorg(reorgFromBlock uint64, newCanonicalHash libcom
 			oldHash = ""
 		} else {
 			rs.logger.Error("Failed to get block data during reorg", "block", reorgFromBlock, "error", err)
-			return err
+			return fmt.Errorf("failed to get block data during reorg: %w", err)
 		}
 	} else {
 		// Parse the RLP encoded block to get its hash
@@ -562,7 +552,7 @@ func (rs *RedisState) handleReorg(reorgFromBlock uint64, newCanonicalHash libcom
 	}
 
 	// Create a context with timeout for the entire reorg operation
-	ctx, cancel := context.WithTimeout(rs.ctx, redisReorgTimeout)
+	ctx, cancel = context.WithTimeout(rs.ctx, redisReorgTimeout)
 	defer cancel()
 
 	// Record reorg information for debugging
@@ -578,8 +568,9 @@ func (rs *RedisState) handleReorg(reorgFromBlock uint64, newCanonicalHash libcom
 
 	reorgData, err := json.Marshal(reorgJSON)
 	if err != nil {
+		rs.pipelineMutex.Unlock()
 		rs.logger.Error("Failed to marshal reorg data", "error", err)
-		return err
+		return fmt.Errorf("failed to marshal reorg data: %w", err)
 	} else {
 		rs.pipeline.Set(ctx, reorgKey, string(reorgData), 0)
 	}
@@ -613,14 +604,15 @@ func (rs *RedisState) handleReorg(reorgFromBlock uint64, newCanonicalHash libcom
 	_, execErr := rs.pipeline.Exec(ctx)
 	rs.pipeline = rs.client.Pipeline() // Create a fresh pipeline
 	if execErr != nil {
+		rs.pipelineMutex.Unlock()
 		rs.logger.Error("Failed to execute block deletion pipeline", "error", execErr)
-		return err
-		// Continue anyway to try to clean up state
+		return fmt.Errorf("failed to execute block deletion during reorg: %w", execErr)
 	}
 
 	err = rs.handleReorgWithBSSL(ctx, reorgFromBlock)
 	if err != nil {
-		return err
+		rs.pipelineMutex.Unlock()
+		return fmt.Errorf("failed to handle BSSL data during reorg: %w", err)
 	}
 
 	// Update current block if needed
@@ -634,9 +626,9 @@ func (rs *RedisState) handleReorg(reorgFromBlock uint64, newCanonicalHash libcom
 	// Execute all remaining commands
 	_, execErr = rs.pipeline.Exec(ctx)
 	if execErr != nil {
-		rs.logger.Error("Failed to execute state cleanup pipeline", "error", execErr)
 		rs.pipelineMutex.Unlock()
-		return err
+		rs.logger.Error("Failed to execute state cleanup pipeline", "error", execErr)
+		return fmt.Errorf("failed to execute state cleanup during reorg: %w", execErr)
 	}
 
 	// Create a fresh pipeline
@@ -690,20 +682,20 @@ func (rs *RedisState) handleReorgWithBSSL(ctx context.Context, reorgFromBlock ui
 			for i, result := range infoResults {
 				if result.Err() != nil {
 					rs.logger.Warn("Error getting info for key", "key", keysToProcess[i], "error", result.Err())
-					return fmt.Errorf("failed to get info for key %s: %w", keysToProcess[i], result.Err())
+					continue
 				}
 
 				// Extract info data
 				infoValue := extractRedisResult(result)
 				if infoValue == nil {
 					rs.logger.Warn("Could not extract value from Redis result", "key", keysToProcess[i])
-					return fmt.Errorf("could not extract value from Redis result for key %s", keysToProcess[i])
+					continue
 				}
 
 				info, ok := infoValue.([]interface{})
 				if !ok || len(info) < 3 {
 					rs.logger.Warn("Invalid info format", "key", keysToProcess[i], "info", infoValue)
-					return fmt.Errorf("invalid info format for key %s: %v", keysToProcess[i], infoValue)
+					continue
 				}
 
 				// Parse last block
@@ -711,7 +703,7 @@ func (rs *RedisState) handleReorgWithBSSL(ctx context.Context, reorgFromBlock ui
 				lastBlock, parseErr := strconv.ParseUint(lastBlockStr, 10, 64)
 				if parseErr != nil {
 					rs.logger.Warn("Failed to parse last block", "key", keysToProcess[i], "value", lastBlockStr, "error", parseErr)
-					return fmt.Errorf("failed to parse last block for key %s: %w", keysToProcess[i], parseErr)
+					continue
 				}
 
 				// Only process keys that have data after the reorg point
@@ -734,7 +726,6 @@ func (rs *RedisState) handleReorgWithBSSL(ctx context.Context, reorgFromBlock ui
 				if result.Err() != nil {
 					if result.Err() != redis.Nil {
 						rs.logger.Warn("Error getting state before reorg", "key", keysToProcess[i], "error", result.Err())
-						return fmt.Errorf("failed to get state before reorg for key %s: %w", keysToProcess[i], result.Err())
 					}
 					continue
 				}
@@ -828,7 +819,7 @@ func (rs *RedisState) GetAccountAtBlock(address libcommon.Address, blockNum uint
 	}
 
 	// Create a context with timeout
-	ctx, cancel := context.WithTimeout(rs.ctx, 5*time.Second)
+	ctx, cancel := context.WithTimeout(rs.ctx, redisOperationTimeout)
 	defer cancel()
 
 	var accountData string

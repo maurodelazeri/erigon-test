@@ -41,42 +41,71 @@ func CreateRedisEnabledWriter(tx kv.TemporalPutDel, blockNum uint64, blockHash l
 }
 
 // UpdateAccountData updates account data and writes to Redis
+// Redis errors are propagated to ensure synchronization
 func (w *StateWriterWithRedis) UpdateAccountData(address libcommon.Address, original, account *accounts.Account) error {
-	// Write to Redis with block hash for chain identity
-	w.redis.writeAccount(w.blockNum, w.blockHash, address, account)
+	// First write to underlying storage
+	if err := w.underlying.UpdateAccountData(address, original, account); err != nil {
+		return err
+	}
 
-	// Pass through to underlying writer
-	return w.underlying.UpdateAccountData(address, original, account)
+	// Then write to Redis with block hash for chain identity
+	if err := w.redis.writeAccount(w.blockNum, w.blockHash, address, account); err != nil {
+		return err
+	}
+
+	return nil
 }
 
 // DeleteAccount deletes an account and writes to Redis
+// Redis errors are propagated to ensure synchronization
 func (w *StateWriterWithRedis) DeleteAccount(address libcommon.Address, original *accounts.Account) error {
-	// Mark as deleted in Redis with block hash for chain identity
-	w.redis.deleteAccount(w.blockNum, w.blockHash, address)
+	// First delete from underlying storage
+	if err := w.underlying.DeleteAccount(address, original); err != nil {
+		return err
+	}
 
-	// Pass through to underlying writer
-	return w.underlying.DeleteAccount(address, original)
+	// Then mark as deleted in Redis with block hash for chain identity
+	if err := w.redis.deleteAccount(w.blockNum, w.blockHash, address); err != nil {
+		return err
+	}
+
+	return nil
 }
 
 // UpdateAccountCode updates account code and writes to Redis
+// Redis errors are propagated to ensure synchronization
 func (w *StateWriterWithRedis) UpdateAccountCode(address libcommon.Address, incarnation uint64, codeHash libcommon.Hash, code []byte) error {
-	// Write code to Redis - code is immutable and addressed by hash
-	w.redis.writeCode(codeHash, code)
+	// First update in underlying storage
+	if err := w.underlying.UpdateAccountCode(address, incarnation, codeHash, code); err != nil {
+		return err
+	}
 
-	// Pass through to underlying writer
-	return w.underlying.UpdateAccountCode(address, incarnation, codeHash, code)
+	// Then write code to Redis
+	if err := w.redis.writeCode(codeHash, code); err != nil {
+		return err
+	}
+
+	return nil
 }
 
 // WriteAccountStorage writes account storage and updates Redis
+// Redis errors are propagated to ensure synchronization
 func (w *StateWriterWithRedis) WriteAccountStorage(address libcommon.Address, incarnation uint64, key *libcommon.Hash, original, value *uint256.Int) error {
-	// Write storage to Redis with block hash for chain identity
-	w.redis.writeStorage(w.blockNum, w.blockHash, address, key, value)
+	// First write to underlying storage
+	if err := w.underlying.WriteAccountStorage(address, incarnation, key, original, value); err != nil {
+		return err
+	}
 
-	// Pass through to underlying writer
-	return w.underlying.WriteAccountStorage(address, incarnation, key, original, value)
+	// Then write storage to Redis with block hash for chain identity
+	if err := w.redis.writeStorage(w.blockNum, w.blockHash, address, key, value); err != nil {
+		return err
+	}
+
+	return nil
 }
 
 // CreateContract creates a contract and updates Redis
+// Redis errors are propagated to ensure synchronization
 func (w *StateWriterWithRedis) CreateContract(address libcommon.Address) error {
 	// Pass through to underlying writer - account creation is handled by UpdateAccountData
 	return w.underlying.CreateContract(address)
