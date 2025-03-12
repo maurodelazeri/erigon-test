@@ -231,8 +231,8 @@ func (rs *RedisState) Close() error {
 	return nil
 }
 
-// beginBlockProcessing starts block processing in Redis
-func (rs *RedisState) beginBlockProcessing(blockNum uint64) error {
+// BeginBlockProcessing starts block processing in Redis
+func (rs *RedisState) BeginBlockProcessing(blockNum uint64) error {
 	if !rs.enabled {
 		return nil
 	}
@@ -251,11 +251,16 @@ func (rs *RedisState) beginBlockProcessing(blockNum uint64) error {
 		// Auto-flush if needed
 		if err := rs.AutoFlushPipeline(); err != nil {
 			rs.logger.Error("Failed to update block processing state in Redis", "block", blockNum, "error", err)
-			return fmt.Errorf("redis error in beginBlockProcessing: %w", err)
+			return fmt.Errorf("redis error in BeginBlockProcessing: %w", err)
 		}
 	}
 
 	return nil
+}
+
+// beginBlockProcessing starts block processing in Redis - legacy name for backwards compatibility
+func (rs *RedisState) beginBlockProcessing(blockNum uint64) error {
+	return rs.BeginBlockProcessing(blockNum)
 }
 
 // FlushPipeline sends all queued commands to Redis
@@ -423,8 +428,8 @@ func (rs *RedisState) writeStorage(blockNum uint64, blockHash libcommon.Hash, ad
 	return nil
 }
 
-// writeBlock writes block data to Redis
-func (rs *RedisState) writeBlock(block *types.Header, blockHash libcommon.Hash) error {
+// WriteBlock writes block data to Redis
+func (rs *RedisState) WriteBlock(block *types.Header, blockHash libcommon.Hash) error {
 	if block == nil || !rs.enabled {
 		return nil
 	}
@@ -454,8 +459,13 @@ func (rs *RedisState) writeBlock(block *types.Header, blockHash libcommon.Hash) 
 	return nil
 }
 
-// writeTx writes transaction data to Redis
-func (rs *RedisState) writeTx(blockNum uint64, blockHash libcommon.Hash, tx types.Transaction, txIndex int) error {
+// Legacy method for backwards compatibility
+func (rs *RedisState) writeBlock(block *types.Header, blockHash libcommon.Hash) error {
+	return rs.WriteBlock(block, blockHash)
+}
+
+// WriteTx writes transaction data to Redis
+func (rs *RedisState) WriteTx(blockNum uint64, blockHash libcommon.Hash, tx types.Transaction, txIndex int) error {
 	if !rs.enabled {
 		return nil
 	}
@@ -486,8 +496,13 @@ func (rs *RedisState) writeTx(blockNum uint64, blockHash libcommon.Hash, tx type
 	return nil
 }
 
-// writeReceipt writes receipt data to Redis
-func (rs *RedisState) writeReceipt(blockNum uint64, blockHash libcommon.Hash, receipt *types.Receipt) error {
+// Legacy method for backwards compatibility
+func (rs *RedisState) writeTx(blockNum uint64, blockHash libcommon.Hash, tx types.Transaction, txIndex int) error {
+	return rs.WriteTx(blockNum, blockHash, tx, txIndex)
+}
+
+// WriteReceipt writes receipt data to Redis
+func (rs *RedisState) WriteReceipt(blockNum uint64, blockHash libcommon.Hash, receipt *types.Receipt) error {
 	if receipt == nil || !rs.enabled {
 		return nil
 	}
@@ -513,6 +528,11 @@ func (rs *RedisState) writeReceipt(blockNum uint64, blockHash libcommon.Hash, re
 	}
 
 	return nil
+}
+
+// Legacy method for backwards compatibility
+func (rs *RedisState) writeReceipt(blockNum uint64, blockHash libcommon.Hash, receipt *types.Receipt) error {
+	return rs.WriteReceipt(blockNum, blockHash, receipt)
 }
 
 // handleReorg handles chain reorganization in Redis with a focus on reliability

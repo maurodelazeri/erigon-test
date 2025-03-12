@@ -61,6 +61,7 @@ import (
 	"github.com/erigontech/erigon-lib/state"
 	"github.com/erigontech/erigon/core/rawdb"
 	coresnaptype "github.com/erigontech/erigon/core/snaptype"
+	corestate "github.com/erigontech/erigon/core/state"
 	"github.com/erigontech/erigon/core/types"
 	"github.com/erigontech/erigon/eth/ethconfig"
 	"github.com/erigontech/erigon/eth/ethconfig/estimate"
@@ -368,6 +369,13 @@ func FillDBFromSnapshots(logPrefix string, ctx context.Context, tx kv.RwTx, dirs
 	defer logEvery.Stop()
 	pruneMarkerBlockThreshold := getPruneMarkerSafeThreshold(blockReader)
 
+	// Get Redis state instance to update with snapshot data
+	redisState := corestate.GetRedisState()
+	redisEnabled := redisState.Enabled()
+	if redisEnabled {
+		logger.Info(fmt.Sprintf("[%s] Redis state shadowing enabled for snapshot sync", logPrefix))
+	}
+
 	// updating the progress of further stages (but only forward) that are contained inside of snapshots
 	for _, stage := range []stages.SyncStage{stages.Headers, stages.Bodies, stages.BlockHashes, stages.Senders} {
 		progress, err := stages.GetStageProgress(tx, stage)
@@ -420,6 +428,17 @@ func FillDBFromSnapshots(logPrefix string, ctx context.Context, tx kv.RwTx, dirs
 					if dbg.PruneTotalDifficulty() {
 						if err := rawdb.WriteTd(tx, blockHash, blockNum, td); err != nil {
 							return err
+						}
+					}
+
+					// Write headers to Redis when processing from snapshots
+					if redisEnabled {
+						if err := redisState.WriteBlock(header, blockHash); err != nil {
+							logger.Warn(fmt.Sprintf("[%s] Failed to write header to Redis during snapshot sync", logPrefix), "block", blockNum, "error", err)
+						}
+						// Begin block processing to update currentBlock
+						if err := redisState.BeginBlockProcessing(blockNum); err != nil {
+							logger.Warn(fmt.Sprintf("[%s] Failed to begin block processing in Redis", logPrefix), "block", blockNum, "error", err)
 						}
 					}
 				}
@@ -494,6 +513,51 @@ func FillDBFromSnapshots(logPrefix string, ctx context.Context, tx kv.RwTx, dirs
 					if err := rawdbv3.TxNums.Append(tx, blockNum, maxTxNum); err != nil {
 						return fmt.Errorf("%w. blockNum=%d, maxTxNum=%d", err, blockNum, maxTxNum)
 					}
+
+					// Write transactions to Redis when processing from snapshots
+					if redisEnabled && txAmount > 0 {
+						// Get the block hash for this block number
+						hash, ok, err := blockReader.CanonicalHash(ctx, tx, blockNum)
+						if err != nil {
+							logger.Warn(fmt.Sprintf("[%s] Failed to get canonical hash for block", logPrefix), "block", blockNum, "error", err)
+						} else if ok {
+							// Load the block with transactions from the snapshot
+							block, _, err := blockReader.BlockWithSenders(ctx, tx, hash, blockNum)
+							if err != nil {
+								logger.Warn(fmt.Sprintf("[%s] Failed to get block with senders", logPrefix), "block", blockNum, "error", err)
+							} else if block != nil {
+								// Write all transactions in the block to Redis
+								for i, tx := range block.Transactions() {
+									if err := redisState.WriteTx(blockNum, hash, tx, i); err != nil {
+										logger.Warn(fmt.Sprintf("[%s] Failed to write transaction to Redis", logPrefix), "block", blockNum, "tx", i, "error", err)
+									}
+								}
+
+									// Read receipts directly from the database for this block
+									receipts := rawdb.ReadRawReceipts(tx, blockNum)
+									if receipts != nil {
+										for i, receipt := range receipts {
+											// Set the blockHash and blockNumber fields which might not be set
+											// Set the blockHash and blockNumber fields which might not be set
+											receipt.BlockHash = hash
+											receipt.BlockNumber = big.NewInt(int64(blockNum))											
+											// Set receipt transaction hash if needed
+											if receipt.TxHash == (common.Hash{}) && i < len(block.Transactions()) {
+												receipt.TxHash = block.Transactions()[i].Hash()
+											}
+											
+											// Set the transaction index if not set
+											if receipt.TransactionIndex == 0 {
+												receipt.TransactionIndex = uint(i)
+											}
+											
+											if err := redisState.WriteReceipt(blockNum, hash, receipt); err != nil {
+												logger.Warn(fmt.Sprintf("[%s] Failed to write receipt to Redis", logPrefix), "block", blockNum, "receipt", receipt.TransactionIndex, "error", err)
+											}
+										}
+									}							}
+						}
+					}
 				}
 				return nil
 			}); err != nil {
@@ -520,6 +584,14 @@ func FillDBFromSnapshots(logPrefix string, ctx context.Context, tx kv.RwTx, dirs
 			})
 		}
 	}
+
+	// Flush any remaining operations in Redis pipeline
+	if redisEnabled {
+		if err := redisState.FlushPipeline(); err != nil {
+			logger.Warn(fmt.Sprintf("[%s] Failed to flush Redis pipeline after snapshot sync", logPrefix), "error", err)
+		}
+	}
+
 	return nil
 }
 
