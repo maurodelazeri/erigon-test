@@ -265,27 +265,31 @@ func write(tx kv.RwTx, g *types.Genesis, dirs datadir.Dirs, logger log.Logger) (
 	redisState := state.GetRedisState()
 	if redisState.Enabled() {
 		monitor := state.NewRedisStateMonitor()
-		
+
 		// First monitor the block processing at block number 0
 		if err := monitor.MonitorBlockProcessing(0); err != nil {
 			logger.Warn("Failed to send genesis block processing to Redis", "err", err)
+			return nil, nil, err
 		}
-		
+
 		// Monitor the genesis block
 		if err := monitor.MonitorBlockData(block.HeaderNoCopy(), block.Hash()); err != nil {
 			logger.Warn("Failed to send genesis block data to Redis", "err", err)
+			return nil, nil, err
 		}
-		
+
 		// Genesis transactions (usually none, but handle them just in case)
 		for i, tx := range block.Transactions() {
 			if err := monitor.MonitorTransaction(0, block.Hash(), tx, i); err != nil {
 				logger.Warn("Failed to send genesis transaction to Redis", "err", err)
+				return nil, nil, err
 			}
 		}
-		
+
 		// Flush Redis data to ensure everything is written
 		if err := monitor.FlushData(); err != nil {
 			logger.Warn("Failed to flush Redis data for genesis block", "err", err)
+			return nil, nil, err
 		}
 	}
 
@@ -558,9 +562,9 @@ func GenesisToBlock(g *types.Genesis, dirs datadir.Dirs, logger log.Logger) (*ty
 
 		//r, w := state.NewDbStateReader(tx), state.NewDbStateWriter(tx, 0)
 		r := state.NewReaderV3(sd)
-			baseWriter := state.NewWriterV4(sd)
-			// Use Redis-enabled writer if Redis state is enabled
-			w := state.WrapStateWriter(baseWriter, 0, head.Hash())
+		baseWriter := state.NewWriterV4(sd)
+		// Use Redis-enabled writer if Redis state is enabled
+		w := state.WrapStateWriter(baseWriter, 0, head.Hash())
 		statedb = state.New(r)
 		statedb.SetTrace(false)
 
