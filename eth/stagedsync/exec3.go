@@ -506,6 +506,13 @@ Loop:
 			return fmt.Errorf("nil block %d", blockNum)
 		}
 
+		// Store block data in Redis if Redis monitoring is enabled
+		if redisMonitor != nil {
+			if err := redisMonitor.MonitorBlockData(b.HeaderNoCopy(), b.Hash()); err != nil {
+				return err
+			}
+		}
+
 		txs := b.Transactions()
 		header := b.HeaderNoCopy()
 		skipAnalysis := core.SkipAnalysis(chainConfig, blockNum)
@@ -736,6 +743,13 @@ Loop:
 		case <-ctx.Done():
 			return ctx.Err()
 		default:
+		}
+		
+		// Flush any pending Redis operations at the end of each block
+		if redisMonitor != nil {
+			if err := redisMonitor.FlushData(); err != nil {
+				return err
+			}
 		}
 	}
 
