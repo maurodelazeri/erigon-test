@@ -261,6 +261,34 @@ func write(tx kv.RwTx, g *types.Genesis, dirs datadir.Dirs, logger log.Logger) (
 		return nil, nil, err
 	}
 
+	// Send genesis block data to Redis if Redis monitoring is enabled
+	redisState := state.GetRedisState()
+	if redisState.Enabled() {
+		monitor := state.NewRedisStateMonitor()
+		
+		// First monitor the block processing at block number 0
+		if err := monitor.MonitorBlockProcessing(0); err != nil {
+			logger.Warn("Failed to send genesis block processing to Redis", "err", err)
+		}
+		
+		// Monitor the genesis block
+		if err := monitor.MonitorBlockData(block.HeaderNoCopy(), block.Hash()); err != nil {
+			logger.Warn("Failed to send genesis block data to Redis", "err", err)
+		}
+		
+		// Genesis transactions (usually none, but handle them just in case)
+		for i, tx := range block.Transactions() {
+			if err := monitor.MonitorTransaction(0, block.Hash(), tx, i); err != nil {
+				logger.Warn("Failed to send genesis transaction to Redis", "err", err)
+			}
+		}
+		
+		// Flush Redis data to ensure everything is written
+		if err := monitor.FlushData(); err != nil {
+			logger.Warn("Failed to flush Redis data for genesis block", "err", err)
+		}
+	}
+
 	return block, statedb, nil
 }
 

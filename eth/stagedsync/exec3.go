@@ -745,8 +745,18 @@ Loop:
 		default:
 		}
 		
-		// Flush any pending Redis operations at the end of each block
+		// Ensure all block receipts are captured for Redis at the end of each block
 		if redisMonitor != nil {
+			// For each receipt in the block, send it to Redis
+			for i, receipt := range blockReceipts {
+				if receipt != nil {
+					if err := redisMonitor.MonitorReceipt(blockNum, b.Hash(), receipt); err != nil {
+						logger.Warn("Failed to send receipt to Redis", "block", blockNum, "txIndex", i, "err", err)
+					}
+				}
+			}
+			
+			// Flush all pending Redis operations at the end of each block
 			if err := redisMonitor.FlushData(); err != nil {
 				return err
 			}
@@ -889,8 +899,6 @@ func flushAndCheckCommitmentV3(ctx context.Context, header *types.Header, applyT
 	// If Redis monitoring is enabled, update the block data and flush all pending Redis operations
 	redisState := state.GetRedisState()
 
-	fmt.Println("flushAndCheckCommitmentV3", redisState.Enabled())
-
 	if redisState.Enabled() && header != nil {
 		// First, flush any pending Redis operations from state changes
 		err := redisState.FlushPipeline()
@@ -900,6 +908,13 @@ func flushAndCheckCommitmentV3(ctx context.Context, header *types.Header, applyT
 
 		// Then record and flush block data
 		monitor := state.NewRedisStateMonitor()
+		
+		// Make sure block is recorded
+		err = monitor.MonitorBlockProcessing(header.Number.Uint64())
+		if err != nil {
+			logger.Warn("Failed to send block processing to Redis", "block", header.Number.Uint64(), "err", err)
+		}
+		
 		err = monitor.MonitorBlockData(header, header.Hash())
 		if err != nil {
 			return false, err
