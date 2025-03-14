@@ -566,26 +566,46 @@ func (rs *RedisState) WriteBlock(block *types.Header, blockHash libcommon.Hash) 
 
 	blockNum := block.Number.Uint64()
 
-	rs.pipelineMutex.Lock()
-	// Encode block header to binary
+	// During snapshot sync, we want to ensure block headers are immediately written
+	// and confirmed in Redis, especially since FinishBlockProcessing checks for them
+	// First encode the block header
 	blockData, err := rlp.EncodeToBytes(block)
 	if err != nil {
-		rs.pipelineMutex.Unlock()
 		rs.logger.Error("Failed to encode block", "blockHash", blockHash, "error", err)
 		return fmt.Errorf("failed to encode block for Redis: %w", err)
 	}
 
-	// Store encoded block header using a simple key-value pair
-	blockKey := fmt.Sprintf("%s%d", blockPrefix, blockNum)
-	rs.pipeline.Set(rs.ctx, blockKey, string(blockData), 0) // Never expires
-	rs.pipelineCount++
-	rs.pipelineMutex.Unlock()
+	// For snapshot sync and critical operations, we use a direct Redis write
+	// instead of the pipeline to ensure immediate persistence
+	ctx, cancel := context.WithTimeout(rs.ctx, redisOperationTimeout)
+	defer cancel()
 
-	// Auto-flush if needed
-	if err := rs.AutoFlushPipeline(); err != nil {
-		return fmt.Errorf("failed to flush block data to Redis: %w", err)
+	// Directly write the block header to Redis with immediate effect
+	blockKey := fmt.Sprintf("%s%d", blockPrefix, blockNum)
+	err = rs.client.Set(ctx, blockKey, string(blockData), 0).Err()
+	if err != nil {
+		rs.logger.Error("Failed to write block header to Redis", "block", blockNum, "hash", blockHash.Hex(), "error", err)
+		return fmt.Errorf("failed to write block header to Redis: %w", err)
 	}
 
+	// Also store block hash mapping for reverse lookups
+	blockHashJSON := BlockHashJSON{
+		Number:    blockNum,
+		Timestamp: block.Time,
+	}
+	hashData, err := json.Marshal(blockHashJSON)
+	if err != nil {
+		rs.logger.Error("Failed to marshal block hash data", "blockHash", blockHash, "error", err)
+		// Continue even if block hash mapping fails - it's less critical than the header itself
+	} else {
+		hashKey := fmt.Sprintf("%s%s", blockHashPrefix, blockHash.Hex())
+		if err = rs.client.Set(ctx, hashKey, string(hashData), 0).Err(); err != nil {
+			rs.logger.Warn("Failed to write block hash mapping to Redis", "block", blockNum, "hash", blockHash.Hex(), "error", err)
+			// Continue even if this fails - it's not critical
+		}
+	}
+
+	rs.logger.Debug("Successfully wrote block header to Redis", "block", blockNum, "hash", blockHash.Hex())
 	return nil
 }
 

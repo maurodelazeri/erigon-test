@@ -447,8 +447,22 @@ func FillDBFromSnapshots(logPrefix string, ctx context.Context, tx kv.RwTx, dirs
 								// 3. Finalize block data only if the previous steps were successful
 								// Since snapshots don't contain tx/receipt data, we need to ensure we write empty arrays
 								monitor := corestate.NewRedisStateMonitor()
-								if err := monitor.FinishBlockProcessing(blockNum); err != nil {
-									logger.Warn(fmt.Sprintf("[%s] Failed to finalize block data in Redis during snapshot sync", logPrefix), "block", blockNum, "error", err)
+								// Add a retry mechanism for block finalization with exponential backoff
+								const maxRetries = 3
+								for retry := 0; retry < maxRetries; retry++ {
+									err := monitor.FinishBlockProcessing(blockNum)
+									if err == nil {
+										break
+									}
+									
+									if retry == maxRetries-1 {
+										logger.Warn(fmt.Sprintf("[%s] Failed to finalize block data in Redis during snapshot sync after %d attempts", logPrefix, maxRetries), "block", blockNum, "error", err)
+									} else {
+										// Log failure but with lower level since we'll retry
+										logger.Debug(fmt.Sprintf("[%s] Retrying Redis block finalization", logPrefix), "block", blockNum, "attempt", retry+1, "error", err)
+										// Add small delay with exponential backoff before retry
+										time.Sleep(time.Duration(50*(1<<retry)) * time.Millisecond)
+									}
 								}
 							}
 						}
