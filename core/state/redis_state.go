@@ -56,6 +56,11 @@ type RedisState struct {
 	pipelineCount int
 	ctx           context.Context
 	bsslAvailable bool
+
+	// Block transaction and receipt collections
+	blockTxs       map[uint64][][]byte // Map of blockNum -> list of encoded transactions
+	blockReceipts  map[uint64][][]byte // Map of blockNum -> list of encoded receipts
+	blockDataMutex sync.Mutex          // Mutex for accessing block data maps
 }
 
 // Global instance
@@ -93,28 +98,18 @@ type ReorgJSON struct {
 }
 
 // Initialize creates or returns the global RedisState instance
-func InitRedisState(redisURL string, redisPassword string, logger log.Logger) *RedisState {
+func InitRedisState(redisURL string, redisPassword string, logger log.Logger) (*RedisState, error) {
+	var initErr error
 	redisInitOnce.Do(func() {
 		if redisURL == "" {
-			redisState = &RedisState{
-				enabled:       false,
-				logger:        logger,
-				ctx:           context.Background(),
-				pipelineCount: 0,
-			}
+			initErr = fmt.Errorf("Redis URL is required, cannot initialize Redis state with empty URL")
 			return
 		}
 
 		// Parse Redis URL to extract address and DB
 		opts, err := redis.ParseURL(redisURL)
 		if err != nil {
-			logger.Error("Invalid Redis URL format", "url", redisURL, "error", err)
-			redisState = &RedisState{
-				enabled:       false,
-				logger:        logger,
-				ctx:           context.Background(),
-				pipelineCount: 0,
-			}
+			initErr = fmt.Errorf("invalid Redis URL format: %w", err)
 			return
 		}
 
@@ -139,13 +134,7 @@ func InitRedisState(redisURL string, redisPassword string, logger log.Logger) *R
 		defer cancel()
 
 		if _, err := client.Ping(ctx).Result(); err != nil {
-			logger.Error("Failed to connect to Redis", "url", redisURL, "error", err)
-			redisState = &RedisState{
-				enabled:       false,
-				logger:        logger,
-				ctx:           context.Background(),
-				pipelineCount: 0,
-			}
+			initErr = fmt.Errorf("failed to connect to Redis: %w", err)
 			return
 		}
 
@@ -179,6 +168,8 @@ func InitRedisState(redisURL string, redisPassword string, logger log.Logger) *R
 			pipeline:      client.Pipeline(),
 			pipelineCount: 0,
 			bsslAvailable: bsslAvailable,
+			blockTxs:      make(map[uint64][][]byte),
+			blockReceipts: make(map[uint64][][]byte),
 		}
 
 		// Load current block if available
@@ -193,17 +184,18 @@ func InitRedisState(redisURL string, redisPassword string, logger log.Logger) *R
 		logger.Info("Redis state integration initialized", "url", redisURL, "enabled", true, "bsslEnabled", bsslAvailable)
 	})
 
-	return redisState
+	if initErr != nil {
+		return nil, initErr
+	}
+	return redisState, nil
 }
 
 // GetRedisState returns the global RedisState instance
 func GetRedisState() *RedisState {
 	if redisState == nil {
-		// Return a disabled instance if not initialized
-		return &RedisState{
-			enabled: false,
-			ctx:     context.Background(),
-		}
+		// If Redis is not initialized, this is a critical error
+		// This will ensure that operations cannot proceed without Redis
+		panic("Redis state not initialized. Redis is required for operation.")
 	}
 	return redisState
 }
@@ -233,9 +225,7 @@ func (rs *RedisState) Close() error {
 
 // BeginBlockProcessing starts block processing in Redis
 func (rs *RedisState) BeginBlockProcessing(blockNum uint64) error {
-	if !rs.enabled {
-		return nil
-	}
+	// We know rs.enabled is always true now with our changes
 
 	rs.blockMutex.Lock()
 	defer rs.blockMutex.Unlock()
@@ -263,13 +253,153 @@ func (rs *RedisState) beginBlockProcessing(blockNum uint64) error {
 	return rs.BeginBlockProcessing(blockNum)
 }
 
-// FlushPipeline sends all queued commands to Redis
-// This is exported to allow explicit flushing at commit points
-func (rs *RedisState) FlushPipeline() error {
-	if !rs.enabled {
+// FinishBlockProcessing writes all collected block data to Redis
+func (rs *RedisState) FinishBlockProcessing(blockNum uint64) error {
+	// First check if the block header exists
+	// If we're calling FinishBlockProcessing but the block header doesn't exist in Redis,
+	// this is now a critical error since we require Redis to be consistent
+	ctx, cancel := context.WithTimeout(rs.ctx, 5*time.Second)
+	defer cancel()
+
+	// Use MULTI/EXEC for atomicity
+	pipe := rs.client.TxPipeline()
+
+	blockExists, err := rs.client.Exists(ctx, fmt.Sprintf("%s%d", blockPrefix, blockNum)).Result()
+	if err != nil {
+		return fmt.Errorf("error checking if block exists in Redis: %w", err)
+	} else if blockExists == 0 {
+		return fmt.Errorf("critical consistency error: block %d header doesn't exist in Redis but trying to finalize. Block headers must be written before finalization", blockNum)
+	}
+
+	// Check if we should write empty arrays for blocks without transactions
+	var writeTxs, writeReceipts bool
+
+	rs.blockDataMutex.Lock()
+	// Check if we have any transaction or receipt data for this block
+	txs, hasTxs := rs.blockTxs[blockNum]
+	receipts, hasReceipts := rs.blockReceipts[blockNum]
+
+	// Important consistency check: If we have transactions but no receipts, or vice versa,
+	// we need to make sure that both collections have entries for consistency
+	if hasTxs && !hasReceipts {
+		rs.logger.Debug("Block has transactions but no receipts in memory", "block", blockNum, "txCount", len(txs))
+		// Create an empty receipts array of the same length as transactions
+		rs.blockReceipts[blockNum] = make([][]byte, len(txs))
+		receipts = rs.blockReceipts[blockNum]
+		hasReceipts = true
+	} else if !hasTxs && hasReceipts {
+		rs.logger.Debug("Block has receipts but no transactions in memory", "block", blockNum, "receiptCount", len(receipts))
+		// Create an empty transactions array of the same length as receipts
+		rs.blockTxs[blockNum] = make([][]byte, len(receipts))
+		txs = rs.blockTxs[blockNum]
+		hasTxs = true
+	}
+
+	// We should write transactions if we have them OR if this is the first time finalizing this block
+	// This ensures that blocks without transactions still get an empty array entry
+	writeTxs = hasTxs
+	writeReceipts = hasReceipts
+
+	// If we don't have any data but it's the first time processing this block,
+	// we'll still write empty arrays to ensure we have entries for all blocks
+	if !hasTxs && !hasReceipts {
+		// Check if we already have these keys by seeing if we've processed this block before
+
+		// Check if transactions key exists
+		txsExists, err := rs.client.Exists(ctx, fmt.Sprintf("%s%d", txsPrefix, blockNum)).Result()
+		if err != nil {
+			rs.blockDataMutex.Unlock()
+			return fmt.Errorf("error checking if transactions exist in Redis: %w", err)
+		}
+
+		receiptsExists, err := rs.client.Exists(ctx, fmt.Sprintf("%s%d", receiptsPrefix, blockNum)).Result()
+		if err != nil {
+			rs.blockDataMutex.Unlock()
+			return fmt.Errorf("error checking if receipts exist in Redis: %w", err)
+		}
+
+		// Always write both or neither for consistency
+		shouldWrite := (txsExists == 0) || (receiptsExists == 0)
+
+		// If either key doesn't exist, write both
+		writeTxs = writeTxs || shouldWrite
+		writeReceipts = writeReceipts || shouldWrite
+	}
+
+	// If there's nothing to do, return early
+	if !writeTxs && !writeReceipts {
+		rs.blockDataMutex.Unlock()
 		return nil
 	}
 
+	// Start Redis transaction to ensure atomicity
+	_, err = pipe.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
+		// Write transactions for the block
+		if writeTxs {
+			// Default to empty array if we don't have any transactions
+			var txsData []byte
+			var err error
+
+			if hasTxs {
+				// Encode the transactions array
+				txsData, err = json.Marshal(txs)
+			} else {
+				// Create an empty array
+				txsData, err = json.Marshal([][]byte{})
+			}
+
+			if err != nil {
+				return fmt.Errorf("failed to encode block transactions array: %w", err)
+			}
+
+			// Write the block's transaction array
+			blockTxsKey := fmt.Sprintf("%s%d", txsPrefix, blockNum)
+			pipe.Set(ctx, blockTxsKey, string(txsData), 0) // Never expires
+		}
+
+		// Write receipts for the block
+		if writeReceipts {
+			// Default to empty array if we don't have any receipts
+			var receiptsData []byte
+			var err error
+
+			if hasReceipts {
+				// Encode the receipts array
+				receiptsData, err = json.Marshal(receipts)
+			} else {
+				// Create an empty array
+				receiptsData, err = json.Marshal([][]byte{})
+			}
+
+			if err != nil {
+				return fmt.Errorf("failed to encode block receipts array: %w", err)
+			}
+
+			// Write the block's receipt array
+			blockReceiptsKey := fmt.Sprintf("%s%d", receiptsPrefix, blockNum)
+			pipe.Set(ctx, blockReceiptsKey, string(receiptsData), 0) // Never expires
+		}
+
+		return nil
+	})
+
+	// Clean up memory after we've encoded the data
+	delete(rs.blockTxs, blockNum)
+	delete(rs.blockReceipts, blockNum)
+	rs.blockDataMutex.Unlock()
+
+	// Execute the transaction
+	_, err = pipe.Exec(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to atomically write block data to Redis: %w", err)
+	}
+
+	return nil
+}
+
+// FlushPipeline sends all queued commands to Redis
+// This is exported to allow explicit flushing at commit points
+func (rs *RedisState) FlushPipeline() error {
 	rs.pipelineMutex.Lock()
 	defer rs.pipelineMutex.Unlock()
 
@@ -464,34 +594,51 @@ func (rs *RedisState) writeBlock(block *types.Header, blockHash libcommon.Hash) 
 	return rs.WriteBlock(block, blockHash)
 }
 
-// WriteTx writes transaction data to Redis
+// WriteTx collects transaction data for batch writing per block
 func (rs *RedisState) WriteTx(blockNum uint64, blockHash libcommon.Hash, tx types.Transaction, txIndex int) error {
 	if !rs.enabled {
 		return nil
 	}
 
-	// Get tx hash
+	// Safety check for null transaction
+	if tx == nil {
+		rs.logger.Warn("Received nil transaction to write to Redis", "block", blockNum, "index", txIndex)
+		return nil // Skip this transaction but don't return an error
+	}
+
+	// Get tx hash for logging
 	txHash := tx.Hash()
 
-	rs.pipelineMutex.Lock()
-	// Store transaction data in Redis
+	// Encode transaction
 	txData, err := rlp.EncodeToBytes(tx)
 	if err != nil {
-		rs.pipelineMutex.Unlock()
 		rs.logger.Error("Failed to encode transaction", "hash", txHash, "error", err)
 		return fmt.Errorf("failed to encode transaction for Redis: %w", err)
 	}
 
-	// Store transaction with key that includes block and index
-	txKey := fmt.Sprintf("%s%d:%d", txsPrefix, blockNum, txIndex)
-	rs.pipeline.Set(rs.ctx, txKey, string(txData), 0) // Never expires
-	rs.pipelineCount++
-	rs.pipelineMutex.Unlock()
+	// Add transaction to the block's collection
+	rs.blockDataMutex.Lock()
+	defer rs.blockDataMutex.Unlock()
 
-	// Auto-flush if needed
-	if err := rs.AutoFlushPipeline(); err != nil {
-		return fmt.Errorf("failed to flush transaction to Redis: %w", err)
+	// Ensure the slice is large enough
+	if txs, exists := rs.blockTxs[blockNum]; !exists || len(txs) <= txIndex {
+		// Create or resize the slice to accommodate the transaction index
+		newSize := txIndex + 1
+		if exists {
+			// If the slice exists but is too small, make it bigger
+			if len(txs) < newSize {
+				newTxs := make([][]byte, newSize)
+				copy(newTxs, txs)
+				rs.blockTxs[blockNum] = newTxs
+			}
+		} else {
+			// Create a new slice if none exists
+			rs.blockTxs[blockNum] = make([][]byte, newSize)
+		}
 	}
+
+	// Store the transaction at the correct index
+	rs.blockTxs[blockNum][txIndex] = txData
 
 	return nil
 }
@@ -501,31 +648,49 @@ func (rs *RedisState) writeTx(blockNum uint64, blockHash libcommon.Hash, tx type
 	return rs.WriteTx(blockNum, blockHash, tx, txIndex)
 }
 
-// WriteReceipt writes receipt data to Redis
+// WriteReceipt collects receipt data for batch writing per block
 func (rs *RedisState) WriteReceipt(blockNum uint64, blockHash libcommon.Hash, receipt *types.Receipt) error {
-	if receipt == nil || !rs.enabled {
+	if !rs.enabled {
 		return nil
 	}
 
-	rs.pipelineMutex.Lock()
+	// Safety check for null receipt
+	if receipt == nil {
+		rs.logger.Warn("Received nil receipt to write to Redis", "block", blockNum)
+		return nil // Skip this receipt but don't return an error
+	}
+
 	// Encode receipt to binary
 	receiptData, err := rlp.EncodeToBytes(receipt)
 	if err != nil {
-		rs.pipelineMutex.Unlock()
 		rs.logger.Error("Failed to encode receipt", "hash", receipt.TxHash, "error", err)
 		return fmt.Errorf("failed to encode receipt for Redis: %w", err)
 	}
 
-	// Store receipt with key that includes block and index
-	receiptKey := fmt.Sprintf("%s%d:%d", receiptsPrefix, blockNum, receipt.TransactionIndex)
-	rs.pipeline.Set(rs.ctx, receiptKey, string(receiptData), 0) // Never expires
-	rs.pipelineCount++
-	rs.pipelineMutex.Unlock()
+	// Add receipt to the block's collection
+	rs.blockDataMutex.Lock()
+	defer rs.blockDataMutex.Unlock()
 
-	// Auto-flush if needed
-	if err := rs.AutoFlushPipeline(); err != nil {
-		return fmt.Errorf("failed to flush receipt to Redis: %w", err)
+	txIndex := receipt.TransactionIndex
+	// Ensure the slice is large enough
+	if receipts, exists := rs.blockReceipts[blockNum]; !exists || len(receipts) <= int(txIndex) {
+		// Create or resize the slice to accommodate the receipt index
+		newSize := int(txIndex) + 1
+		if exists {
+			// If the slice exists but is too small, make it bigger
+			if len(receipts) < newSize {
+				newReceipts := make([][]byte, newSize)
+				copy(newReceipts, receipts)
+				rs.blockReceipts[blockNum] = newReceipts
+			}
+		} else {
+			// Create a new slice if none exists
+			rs.blockReceipts[blockNum] = make([][]byte, newSize)
+		}
 	}
+
+	// Store the receipt at the correct index
+	rs.blockReceipts[blockNum][txIndex] = receiptData
 
 	return nil
 }
@@ -535,12 +700,8 @@ func (rs *RedisState) writeReceipt(blockNum uint64, blockHash libcommon.Hash, re
 	return rs.WriteReceipt(blockNum, blockHash, receipt)
 }
 
-// handleReorg handles chain reorganization in Redis with a focus on reliability
+// handleReorg handles chain reorganization in Redis with a focus on reliability and atomicity
 func (rs *RedisState) handleReorg(reorgFromBlock uint64, newCanonicalHash libcommon.Hash) error {
-	if !rs.enabled {
-		return nil
-	}
-
 	rs.logger.Info("Handling chain reorganization", "fromBlock", reorgFromBlock, "newCanonicalHash", newCanonicalHash.Hex())
 
 	// Create a context with timeout for the operation to fetch old block hash
@@ -571,13 +732,29 @@ func (rs *RedisState) handleReorg(reorgFromBlock uint64, newCanonicalHash libcom
 		}
 	}
 
+	// Check if the current block is far ahead of the reorg point, which could indicate
+	// we're doing a reorg during or after a snapshot sync. In that case, we should be
+	// more careful about deleting data.
+	rs.blockMutex.RLock()
+	currentBlock := rs.currentBlock
+	rs.blockMutex.RUnlock()
+
+	if currentBlock > reorgFromBlock+1000 {
+		rs.logger.Warn("Large gap between reorg point and current block",
+			"reorgBlock", reorgFromBlock,
+			"currentBlock", currentBlock,
+			"gap", currentBlock-reorgFromBlock)
+	}
+
 	// Create a context with timeout for the entire reorg operation
 	ctx, cancel = context.WithTimeout(rs.ctx, redisReorgTimeout)
 	defer cancel()
 
+	// Use MULTI/EXEC for atomicity
+	pipe := rs.client.TxPipeline()
+
 	// Record reorg information for debugging
 	reorgKey := fmt.Sprintf("%s%d", reorgPrefix, reorgFromBlock)
-	rs.pipelineMutex.Lock()
 
 	// Track reorg metadata
 	reorgJSON := ReorgJSON{
@@ -588,72 +765,76 @@ func (rs *RedisState) handleReorg(reorgFromBlock uint64, newCanonicalHash libcom
 
 	reorgData, err := json.Marshal(reorgJSON)
 	if err != nil {
-		rs.pipelineMutex.Unlock()
 		rs.logger.Error("Failed to marshal reorg data", "error", err)
 		return fmt.Errorf("failed to marshal reorg data: %w", err)
-	} else {
-		rs.pipeline.Set(ctx, reorgKey, string(reorgData), 0)
 	}
 
-	// Delete all block data from reorgFromBlock and higher
-	for i := reorgFromBlock; i <= rs.currentBlock; i++ {
-		// Delete block
-		rs.pipeline.Del(ctx, fmt.Sprintf("%s%d", blockPrefix, i))
+	// Start a transaction for metadata and block deletion
+	_, err = pipe.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
+		// Store reorg metadata
+		pipe.Set(ctx, reorgKey, string(reorgData), 0)
 
-		// Find and delete transactions with this block number
-		txScanPattern := fmt.Sprintf("%s%d:*", txsPrefix, i)
-		txsToDelete, _ := rs.client.Keys(ctx, txScanPattern).Result()
-		for _, key := range txsToDelete {
-			rs.pipeline.Del(ctx, key)
+		// Delete all block data from reorgFromBlock and higher in a single atomic transaction
+		var keysToDelete []string
+
+		// Find all keys that need to be deleted
+		for i := reorgFromBlock; i <= currentBlock; i++ {
+			blockKey := fmt.Sprintf("%s%d", blockPrefix, i)
+			blockTxsKey := fmt.Sprintf("%s%d", txsPrefix, i)
+			blockReceiptsKey := fmt.Sprintf("%s%d", receiptsPrefix, i)
+
+			// Get existence information for all keys at once
+			exists, err := rs.client.Exists(ctx, blockKey, blockTxsKey, blockReceiptsKey).Result()
+			if err != nil {
+				return fmt.Errorf("failed to check key existence during reorg: %w", err)
+			}
+
+			if exists > 0 {
+				// Check individual keys
+				if exists, _ := rs.client.Exists(ctx, blockKey).Result(); exists > 0 {
+					keysToDelete = append(keysToDelete, blockKey)
+				}
+
+				if exists, _ := rs.client.Exists(ctx, blockTxsKey).Result(); exists > 0 {
+					keysToDelete = append(keysToDelete, blockTxsKey)
+				}
+
+				if exists, _ := rs.client.Exists(ctx, blockReceiptsKey).Result(); exists > 0 {
+					keysToDelete = append(keysToDelete, blockReceiptsKey)
+				}
+			}
 		}
 
-		// Find and delete receipts with this block number
-		receiptScanPattern := fmt.Sprintf("%s%d:*", receiptsPrefix, i)
-		receiptsToDelete, _ := rs.client.Keys(ctx, receiptScanPattern).Result()
-		for _, key := range receiptsToDelete {
-			rs.pipeline.Del(ctx, key)
+		// Delete all block hash entries
+		if oldHash != "" {
+			keysToDelete = append(keysToDelete, fmt.Sprintf("%s%s", blockHashPrefix, oldHash))
 		}
+
+		// Delete all keys in a single operation if any exist
+		if len(keysToDelete) > 0 {
+			pipe.Del(ctx, keysToDelete...)
+		}
+
+		// Update current block
+		rs.blockMutex.Lock()
+		if reorgFromBlock <= rs.currentBlock {
+			rs.currentBlock = reorgFromBlock - 1
+			pipe.Set(ctx, "currentBlock", rs.currentBlock, 0)
+		}
+		rs.blockMutex.Unlock()
+
+		return nil
+	})
+
+	if err != nil {
+		return fmt.Errorf("failed to execute atomic block deletion during reorg: %w", err)
 	}
 
-	// Delete the block hash entry
-	if oldHash != "" {
-		rs.pipeline.Del(ctx, fmt.Sprintf("%s%s", blockHashPrefix, oldHash))
-	}
-
-	// Execute the block/transaction deletion commands first
-	_, execErr := rs.pipeline.Exec(ctx)
-	rs.pipeline = rs.client.Pipeline() // Create a fresh pipeline
-	if execErr != nil {
-		rs.pipelineMutex.Unlock()
-		rs.logger.Error("Failed to execute block deletion pipeline", "error", execErr)
-		return fmt.Errorf("failed to execute block deletion during reorg: %w", execErr)
-	}
-
+	// Handle BSSL data separately (since it has its own batch processing)
 	err = rs.handleReorgWithBSSL(ctx, reorgFromBlock)
 	if err != nil {
-		rs.pipelineMutex.Unlock()
 		return fmt.Errorf("failed to handle BSSL data during reorg: %w", err)
 	}
-
-	// Update current block if needed
-	rs.blockMutex.Lock()
-	if reorgFromBlock <= rs.currentBlock {
-		rs.currentBlock = reorgFromBlock - 1
-		rs.pipeline.Set(ctx, "currentBlock", rs.currentBlock, 0)
-	}
-	rs.blockMutex.Unlock()
-
-	// Execute all remaining commands
-	_, execErr = rs.pipeline.Exec(ctx)
-	if execErr != nil {
-		rs.pipelineMutex.Unlock()
-		rs.logger.Error("Failed to execute state cleanup pipeline", "error", execErr)
-		return fmt.Errorf("failed to execute state cleanup during reorg: %w", execErr)
-	}
-
-	// Create a fresh pipeline
-	rs.pipeline = rs.client.Pipeline()
-	rs.pipelineMutex.Unlock()
 
 	rs.logger.Info("Chain reorganization completed", "fromBlock", reorgFromBlock)
 	return nil
@@ -954,87 +1135,35 @@ func (rs *RedisState) GetTransactionsByBlockNumber(blockNum uint64) ([]types.Tra
 	ctx, cancel := context.WithTimeout(rs.ctx, 5*time.Second)
 	defer cancel()
 
-	// Find all tx keys for this block
-	txKeys, err := rs.client.Keys(ctx, fmt.Sprintf("%s%d:*", txsPrefix, blockNum)).Result()
+	// Get the block transactions collection
+	blockTxsKey := fmt.Sprintf("%s%d", txsPrefix, blockNum)
+	blockTxsData, err := rs.client.Get(ctx, blockTxsKey).Bytes()
+
 	if err != nil {
-		return nil, fmt.Errorf("transaction key lookup failed: %v", err)
+		if err == redis.Nil {
+			return []types.Transaction{}, nil // No transactions for this block
+		}
+		return nil, fmt.Errorf("failed to get block transactions: %v", err)
 	}
 
-	if len(txKeys) == 0 {
-		return []types.Transaction{}, nil
+	// Decode the array of encoded transactions
+	var encodedTxs [][]byte
+	if err := json.Unmarshal(blockTxsData, &encodedTxs); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal block transactions array: %v", err)
 	}
 
-	// Create sorted array of transactions
-	txs := make([]types.Transaction, len(txKeys))
-	var wg sync.WaitGroup
-	var errMutex sync.Mutex
-	var firstErr error
+	// Decode each transaction
+	txs := make([]types.Transaction, len(encodedTxs))
+	for i, encodedTx := range encodedTxs {
+		if encodedTx == nil {
+			continue // Skip nil entries (shouldn't happen, but just in case)
+		}
 
-	for _, key := range txKeys {
-		wg.Add(1)
-		go func(txKey string) {
-			defer wg.Add(-1)
-
-			// Extract index from key pattern txs:BLOCK:INDEX
-			parts := strings.Split(txKey, ":")
-			if len(parts) != 3 {
-				errMutex.Lock()
-				if firstErr == nil {
-					firstErr = fmt.Errorf("invalid transaction key format: %s", txKey)
-				}
-				errMutex.Unlock()
-				return
-			}
-
-			idxStr := parts[2]
-			idx, err := strconv.Atoi(idxStr)
-			if err != nil {
-				errMutex.Lock()
-				if firstErr == nil {
-					firstErr = fmt.Errorf("invalid transaction index in key: %s", txKey)
-				}
-				errMutex.Unlock()
-				return
-			}
-
-			// Get transaction data
-			txData, err := rs.client.Get(ctx, txKey).Bytes()
-			if err != nil {
-				errMutex.Lock()
-				if firstErr == nil {
-					firstErr = fmt.Errorf("failed to get transaction data: %v", err)
-				}
-				errMutex.Unlock()
-				return
-			}
-
-			// Decode transaction
-			var tx types.Transaction
-			if err := rlp.DecodeBytes(txData, &tx); err != nil {
-				errMutex.Lock()
-				if firstErr == nil {
-					firstErr = fmt.Errorf("failed to decode transaction: %v", err)
-				}
-				errMutex.Unlock()
-				return
-			}
-
-			if idx < len(txs) {
-				txs[idx] = tx
-			} else {
-				errMutex.Lock()
-				if firstErr == nil {
-					firstErr = fmt.Errorf("transaction index out of range: %d", idx)
-				}
-				errMutex.Unlock()
-			}
-		}(key)
-	}
-
-	wg.Wait()
-
-	if firstErr != nil {
-		return nil, firstErr
+		var tx types.Transaction
+		if err := rlp.DecodeBytes(encodedTx, &tx); err != nil {
+			return nil, fmt.Errorf("failed to decode transaction at index %d: %v", i, err)
+		}
+		txs[i] = tx
 	}
 
 	return txs, nil
@@ -1050,59 +1179,35 @@ func (rs *RedisState) GetTransactionHashesByBlockNumber(blockNum uint64) ([]stri
 	ctx, cancel := context.WithTimeout(rs.ctx, 5*time.Second)
 	defer cancel()
 
-	// Find all tx keys for this block
-	txKeys, err := rs.client.Keys(ctx, fmt.Sprintf("%s%d:*", txsPrefix, blockNum)).Result()
+	// Get the block transactions collection
+	blockTxsKey := fmt.Sprintf("%s%d", txsPrefix, blockNum)
+	blockTxsData, err := rs.client.Get(ctx, blockTxsKey).Bytes()
+
 	if err != nil {
-		return nil, fmt.Errorf("transaction key lookup failed: %v", err)
+		if err == redis.Nil {
+			return []string{}, nil // No transactions for this block
+		}
+		return nil, fmt.Errorf("failed to get block transactions: %v", err)
 	}
 
-	if len(txKeys) == 0 {
-		return []string{}, nil
+	// Decode the array of encoded transactions
+	var encodedTxs [][]byte
+	if err := json.Unmarshal(blockTxsData, &encodedTxs); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal block transactions array: %v", err)
 	}
 
-	// Get and decode all transactions
-	txHashes := make([]string, 0, len(txKeys))
-	var wg sync.WaitGroup
-	var mu sync.Mutex
-	var firstErr error
+	// Get the hash for each transaction
+	txHashes := make([]string, 0, len(encodedTxs))
+	for _, encodedTx := range encodedTxs {
+		if encodedTx == nil {
+			continue // Skip nil entries (shouldn't happen, but just in case)
+		}
 
-	for _, key := range txKeys {
-		wg.Add(1)
-		go func(txKey string) {
-			defer wg.Add(-1)
-
-			// Get transaction data
-			txData, err := rs.client.Get(ctx, txKey).Bytes()
-			if err != nil {
-				mu.Lock()
-				if firstErr == nil {
-					firstErr = fmt.Errorf("failed to get transaction data: %v", err)
-				}
-				mu.Unlock()
-				return
-			}
-
-			// Decode enough of transaction to get hash
-			var tx types.Transaction
-			if err := rlp.DecodeBytes(txData, &tx); err != nil {
-				mu.Lock()
-				if firstErr == nil {
-					firstErr = fmt.Errorf("failed to decode transaction: %v", err)
-				}
-				mu.Unlock()
-				return
-			}
-
-			mu.Lock()
-			txHashes = append(txHashes, tx.Hash().Hex())
-			mu.Unlock()
-		}(key)
-	}
-
-	wg.Wait()
-
-	if firstErr != nil {
-		return nil, firstErr
+		var tx types.Transaction
+		if err := rlp.DecodeBytes(encodedTx, &tx); err != nil {
+			return nil, fmt.Errorf("failed to decode transaction: %v", err)
+		}
+		txHashes = append(txHashes, tx.Hash().Hex())
 	}
 
 	return txHashes, nil
@@ -1118,87 +1223,35 @@ func (rs *RedisState) GetReceiptsByBlockNumber(blockNum uint64) ([]*types.Receip
 	ctx, cancel := context.WithTimeout(rs.ctx, 5*time.Second)
 	defer cancel()
 
-	// Find all receipt keys for this block
-	receiptKeys, err := rs.client.Keys(ctx, fmt.Sprintf("%s%d:*", receiptsPrefix, blockNum)).Result()
+	// Get the block receipts collection
+	blockReceiptsKey := fmt.Sprintf("%s%d", receiptsPrefix, blockNum)
+	blockReceiptsData, err := rs.client.Get(ctx, blockReceiptsKey).Bytes()
+
 	if err != nil {
-		return nil, fmt.Errorf("receipt key lookup failed: %v", err)
+		if err == redis.Nil {
+			return []*types.Receipt{}, nil // No receipts for this block
+		}
+		return nil, fmt.Errorf("failed to get block receipts: %v", err)
 	}
 
-	if len(receiptKeys) == 0 {
-		return []*types.Receipt{}, nil
+	// Decode the array of encoded receipts
+	var encodedReceipts [][]byte
+	if err := json.Unmarshal(blockReceiptsData, &encodedReceipts); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal block receipts array: %v", err)
 	}
 
-	// Create sorted array of receipts
-	receipts := make([]*types.Receipt, len(receiptKeys))
-	var wg sync.WaitGroup
-	var errMutex sync.Mutex
-	var firstErr error
+	// Decode each receipt
+	receipts := make([]*types.Receipt, len(encodedReceipts))
+	for i, encodedReceipt := range encodedReceipts {
+		if encodedReceipt == nil {
+			continue // Skip nil entries (shouldn't happen, but just in case)
+		}
 
-	for _, key := range receiptKeys {
-		wg.Add(1)
-		go func(receiptKey string) {
-			defer wg.Add(-1)
-
-			// Extract index from key pattern receipts:BLOCK:INDEX
-			parts := strings.Split(receiptKey, ":")
-			if len(parts) != 3 {
-				errMutex.Lock()
-				if firstErr == nil {
-					firstErr = fmt.Errorf("invalid receipt key format: %s", receiptKey)
-				}
-				errMutex.Unlock()
-				return
-			}
-
-			idxStr := parts[2]
-			idx, err := strconv.Atoi(idxStr)
-			if err != nil {
-				errMutex.Lock()
-				if firstErr == nil {
-					firstErr = fmt.Errorf("invalid receipt index in key: %s", receiptKey)
-				}
-				errMutex.Unlock()
-				return
-			}
-
-			// Get receipt data
-			receiptData, err := rs.client.Get(ctx, receiptKey).Bytes()
-			if err != nil {
-				errMutex.Lock()
-				if firstErr == nil {
-					firstErr = fmt.Errorf("failed to get receipt data: %v", err)
-				}
-				errMutex.Unlock()
-				return
-			}
-
-			// Decode receipt
-			var receipt types.Receipt
-			if err := rlp.DecodeBytes(receiptData, &receipt); err != nil {
-				errMutex.Lock()
-				if firstErr == nil {
-					firstErr = fmt.Errorf("failed to decode receipt: %v", err)
-				}
-				errMutex.Unlock()
-				return
-			}
-
-			if idx < len(receipts) {
-				receipts[idx] = &receipt
-			} else {
-				errMutex.Lock()
-				if firstErr == nil {
-					firstErr = fmt.Errorf("receipt index out of range: %d", idx)
-				}
-				errMutex.Unlock()
-			}
-		}(key)
-	}
-
-	wg.Wait()
-
-	if firstErr != nil {
-		return nil, firstErr
+		var receipt types.Receipt
+		if err := rlp.DecodeBytes(encodedReceipt, &receipt); err != nil {
+			return nil, fmt.Errorf("failed to decode receipt at index %d: %v", i, err)
+		}
+		receipts[i] = &receipt
 	}
 
 	return receipts, nil

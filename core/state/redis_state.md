@@ -4,6 +4,8 @@
 
 The Redis state integration allows Erigon to store blockchain data in Redis, making it possible to instantly access historical state from any block height. Instead of having to replay transactions or recreate historical states, you can query an account or storage slot's value at any point in history with consistent O(1) performance.
 
+> **IMPORTANT**: Redis is a required component for Erigon operation. The node will not start without a valid Redis connection. This ensures that Redis state is always in sync with the blockchain state.
+
 This document explains how the integration works, how data is stored, and how to query it - all without requiring prior knowledge of the system.
 
 ## Why Use Redis for Blockchain State?
@@ -118,22 +120,28 @@ Block hash mapping is stored as JSON:
 #### 6. Transactions
 
 ```
-Key: txs:{blockNum}:{txIndex}
-Example: txs:15000000:0, txs:15000000:1, txs:15000000:2...
+Key: txs:{blockNum}
+Example: txs:15000000
 Storage: Redis string (SET)
 ```
 
-Each transaction is stored as RLP-encoded binary data in its own key, with the transaction index included in the key.
+All transactions for a block are stored together as a JSON array of RLP-encoded binary data in a single key.
+
+For blocks with no transactions, an empty array is stored.
 
 #### 7. Receipts
 
 ```
-Key: receipts:{blockNum}:{txIndex}
-Example: receipts:15000000:0, receipts:15000000:1, receipts:15000000:2...
+Key: receipts:{blockNum}
+Example: receipts:15000000
 Storage: Redis string (SET)
 ```
 
-Each receipt is stored as RLP-encoded binary data in its own key, with the transaction index included in the key.
+All receipts for a block are stored together as a JSON array of RLP-encoded binary data in a single key.
+
+For blocks with no receipts, an empty array is stored.
+
+> Note: Transaction and receipt arrays maintain the same length for any given block, ensuring data consistency.
 
 #### 8. Current Block Tracker
 
@@ -239,69 +247,35 @@ Response (JSON string):
 
 ### Transactions in a Block
 
-To get all transactions in a block, first get all transaction keys:
+To get all transactions in a block in a single query:
 
 ```
-KEYS txs:{blockNum}:*
+GET txs:{blockNum}
 ```
 
 Example:
 
 ```
-KEYS txs:15000000:*
+GET txs:15000000
 ```
 
-Response:
-
-```
-1) "txs:15000000:0"
-2) "txs:15000000:1"
-3) "txs:15000000:2"
-...
-```
-
-Then get each transaction:
-
-```
-GET txs:15000000:0
-GET txs:15000000:1
-...
-```
-
-Each response contains RLP-encoded transaction data.
+The response is a JSON array of RLP-encoded transaction data, which needs to be decoded.
 
 ### Receipts in a Block
 
-To get all receipts in a block, first get all receipt keys:
+To get all receipts in a block in a single query:
 
 ```
-KEYS receipts:{blockNum}:*
+GET receipts:{blockNum}
 ```
 
 Example:
 
 ```
-KEYS receipts:15000000:*
+GET receipts:15000000
 ```
 
-Response:
-
-```
-1) "receipts:15000000:0"
-2) "receipts:15000000:1"
-3) "receipts:15000000:2"
-...
-```
-
-Then get each receipt:
-
-```
-GET receipts:15000000:0
-GET receipts:15000000:1
-...
-```
-
-Each response contains RLP-encoded receipt data.
+The response is a JSON array of RLP-encoded receipt data, which needs to be decoded.
 
 ### Contract Code
 
@@ -366,11 +340,11 @@ If you query for block 750, you'll get the state from block 500, since that was 
 Chain reorganizations (reorgs) happen when the blockchain forks and a non-canonical chain becomes canonical. The Redis integration handles this by:
 
 1. Detecting the reorg point (where the chain diverged)
-2. Deleting all block data, transactions, and receipts from the non-canonical chain
+2. Atomically deleting all block data, transactions, and receipts from the non-canonical chain
 3. Restoring state at the reorg point to match what it was before the reorg
 4. Updating Redis to reflect the new canonical chain
 
-This ensures that historical queries return accurate results even after reorgs.
+The reorg process uses Redis transactions to ensure atomic updates, guaranteeing that Redis state remains consistent even if a reorg happens during processing or if the node crashes mid-operation. This ensures that historical queries return accurate results even after reorgs.
 
 ## Go API Examples
 
@@ -456,7 +430,11 @@ for i, hash := range txHashes {
 
 4. **Timeout Handling**: Set appropriate timeouts for Redis operations to prevent hanging during network issues.
 
-5. **Error Recovery**: The integration includes automatic pipeline recovery for errors, but your application should handle Redis errors gracefully.
+5. **Redis Connection**: Ensure Redis is always available and has sufficient memory. Erigon cannot operate without a functioning Redis connection.
+
+6. **Atomic Operations**: For reliability in client applications, consider using Redis transactions when writing to Redis alongside reading blockchain state.
+
+7. **Data Consistency**: Verify that transaction and receipt arrays for a block have matching lengths, as our implementation ensures this consistency.
 
 ## Troubleshooting
 

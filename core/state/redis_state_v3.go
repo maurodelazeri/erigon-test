@@ -52,6 +52,11 @@ func (rm *RedisStateMonitor) FlushData() error {
 	return rm.redis.FlushPipeline()
 }
 
+// FinishBlockProcessing completes block processing and writes all collected block data
+func (rm *RedisStateMonitor) FinishBlockProcessing(blockNum uint64) error {
+	return rm.redis.FinishBlockProcessing(blockNum)
+}
+
 // MonitorUnwind handles Redis data cleanup during chain reorganization
 func (rm *RedisStateMonitor) MonitorUnwind(tx kv.RwTx, blockUnwindTo uint64) error {
 	// First get the new canonical block hash (the one we're rewinding to)

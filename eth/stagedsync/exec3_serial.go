@@ -125,6 +125,14 @@ func (se *serialExecutor) execute(ctx context.Context, tasks []*state.TxTask) (c
 					if err != nil {
 						return false, err
 					}
+					
+					// For the last transaction in the block, also finalize the block data
+					if txTask.TxIndex == len(txTask.BlockReceipts)-1 {
+						if err := monitor.FinishBlockProcessing(txTask.BlockNum); err != nil {
+							// Just log the error but don't fail the execution
+							se.logger.Warn("Failed to finalize block data in Redis", "block", txTask.BlockNum, "err", err)
+						}
+					}
 				}
 			}
 			if err := rawtemporaldb.AppendReceipt(se.doms, receipt, se.blobGasUsed); err != nil {

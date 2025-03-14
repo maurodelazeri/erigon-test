@@ -291,6 +291,12 @@ func write(tx kv.RwTx, g *types.Genesis, dirs datadir.Dirs, logger log.Logger) (
 			logger.Warn("Failed to flush Redis data for genesis block", "err", err)
 			return nil, nil, err
 		}
+		
+		// Finalize block data for genesis block
+		if err := monitor.FinishBlockProcessing(0); err != nil {
+			logger.Warn("Failed to finalize genesis block data in Redis", "err", err)
+			return nil, nil, err
+		}
 	}
 
 	return block, statedb, nil

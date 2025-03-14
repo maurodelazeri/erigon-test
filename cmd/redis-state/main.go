@@ -455,40 +455,43 @@ func (r *RedisStateProvider) GetBlockByNumber(ctx context.Context, blockNumber r
 
 // GetTransactionsByBlockNumber retrieves all transactions in a block
 func (r *RedisStateProvider) GetTransactionsByBlockNumber(ctx context.Context, blockNum uint64) ([]types.Transaction, error) {
-	// Find all transaction keys for this block
-	pattern := fmt.Sprintf("txs:%d:*", blockNum)
-	txKeys, err := r.redisClient.Keys(ctx, pattern).Result()
+	// Get the block transactions collection
+	blockTxsKey := fmt.Sprintf("txs:%d", blockNum)
+	blockTxsData, err := r.redisClient.Get(ctx, blockTxsKey).Bytes()
+	
 	if err != nil {
-		return nil, fmt.Errorf("failed to find transaction keys: %w", err)
-	}
-
-	if len(txKeys) == 0 {
-		return []types.Transaction{}, nil
-	}
-
-	// Get each transaction and parse it
-	txs := make([]types.Transaction, 0, len(txKeys))
-
-	for _, key := range txKeys {
-		// Get transaction data
-		data, err := r.redisClient.Get(ctx, key).Bytes()
-		if err != nil {
-			if err == redis.Nil {
-				continue // Skip if not found
-			}
-			return nil, fmt.Errorf("failed to get transaction data for key %s: %w", key, err)
+		if err == redis.Nil {
+			return []types.Transaction{}, nil // No transactions for this block
 		}
-
-		// Decode transaction
+		return nil, fmt.Errorf("failed to get block transactions: %w", err)
+	}
+	
+	// Decode the array of encoded transactions
+	var encodedTxs [][]byte
+	if err := json.Unmarshal(blockTxsData, &encodedTxs); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal block transactions array: %w", err)
+	}
+	
+	// Handle empty array case
+	if len(encodedTxs) == 0 {
+		return []types.Transaction{}, nil // Empty block
+	}
+	
+	// Decode each transaction
+	txs := make([]types.Transaction, 0, len(encodedTxs))
+	for _, encodedTx := range encodedTxs {
+		if encodedTx == nil {
+			continue // Skip nil entries (shouldn't happen, but just in case)
+		}
+		
 		var tx types.Transaction
-		if err := rlp.DecodeBytes(data, &tx); err != nil {
-			r.logger.Warn("Failed to decode transaction", "key", key, "error", err)
+		if err := rlp.DecodeBytes(encodedTx, &tx); err != nil {
+			r.logger.Warn("Failed to decode transaction", "error", err)
 			continue
 		}
-
 		txs = append(txs, tx)
 	}
-
+	
 	return txs, nil
 }
 

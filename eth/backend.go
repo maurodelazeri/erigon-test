@@ -1102,10 +1102,21 @@ func (s *Ethereum) Init(stack *node.Node, config *ethconfig.Config, chainConfig 
 	var err error
 	
 	// Initialize Redis connection if configured
-	if config.RedisURL != "" {
-		state.InitRedisState(config.RedisURL, config.RedisPassword, s.logger)
-		s.logger.Info("Redis state integration enabled", "url", config.RedisURL)
+	// Redis is now required for operation - this will panic if Redis is not available
+	if config.RedisURL == "" {
+		return fmt.Errorf("Redis URL is required, please specify --redis.url flag")
 	}
+	
+	redisState, err := state.InitRedisState(config.RedisURL, config.RedisPassword, s.logger)
+	if err != nil {
+		return fmt.Errorf("failed to initialize Redis: %w", err)
+	}
+	
+	if !redisState.Enabled() {
+		return fmt.Errorf("Redis initialization failed - Redis is required for operation")
+	}
+	
+	s.logger.Info("Redis state integration enabled", "url", config.RedisURL)
 
 	if chainConfig.Bor == nil {
 		s.sentriesClient.Hd.StartPoSDownloader(s.sentryCtx, s.sentriesClient.SendHeaderRequest, s.sentriesClient.Penalize)

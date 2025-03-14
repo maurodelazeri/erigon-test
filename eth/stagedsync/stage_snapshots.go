@@ -46,6 +46,8 @@ import (
 
 	"github.com/erigontech/erigon-lib/diagnostics"
 	"github.com/erigontech/erigon-lib/kv/temporal"
+	
+	corestate "github.com/erigontech/erigon/core/state"
 
 	"github.com/erigontech/erigon-lib/chain"
 	"github.com/erigontech/erigon-lib/chain/snapcfg"
@@ -61,7 +63,6 @@ import (
 	"github.com/erigontech/erigon-lib/state"
 	"github.com/erigontech/erigon/core/rawdb"
 	coresnaptype "github.com/erigontech/erigon/core/snaptype"
-	corestate "github.com/erigontech/erigon/core/state"
 	"github.com/erigontech/erigon/core/types"
 	"github.com/erigontech/erigon/eth/ethconfig"
 	"github.com/erigontech/erigon/eth/ethconfig/estimate"
@@ -433,12 +434,23 @@ func FillDBFromSnapshots(logPrefix string, ctx context.Context, tx kv.RwTx, dirs
 
 					// Write headers to Redis when processing from snapshots
 					if redisEnabled {
+						// We need to carefully handle Redis updates during snapshot sync to ensure data consistency
+						
+						// 1. First write the block header
 						if err := redisState.WriteBlock(header, blockHash); err != nil {
 							logger.Warn(fmt.Sprintf("[%s] Failed to write header to Redis during snapshot sync", logPrefix), "block", blockNum, "error", err)
-						}
-						// Begin block processing to update currentBlock
-						if err := redisState.BeginBlockProcessing(blockNum); err != nil {
-							logger.Warn(fmt.Sprintf("[%s] Failed to begin block processing in Redis", logPrefix), "block", blockNum, "error", err)
+						} else {
+							// 2. Only update the currentBlock if writing the header was successful
+							if err := redisState.BeginBlockProcessing(blockNum); err != nil {
+								logger.Warn(fmt.Sprintf("[%s] Failed to begin block processing in Redis", logPrefix), "block", blockNum, "error", err)
+							} else {
+								// 3. Finalize block data only if the previous steps were successful
+								// Since snapshots don't contain tx/receipt data, we need to ensure we write empty arrays
+								monitor := corestate.NewRedisStateMonitor()
+								if err := monitor.FinishBlockProcessing(blockNum); err != nil {
+									logger.Warn(fmt.Sprintf("[%s] Failed to finalize block data in Redis during snapshot sync", logPrefix), "block", blockNum, "error", err)
+								}
+							}
 						}
 					}
 				}

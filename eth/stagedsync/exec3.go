@@ -760,6 +760,12 @@ Loop:
 			if err := redisMonitor.FlushData(); err != nil {
 				return err
 			}
+			
+			// Finalize block processing to write collected block data
+			if err := redisMonitor.FinishBlockProcessing(blockNum); err != nil {
+				logger.Warn("Failed to finalize block data in Redis", "block", blockNum, "err", err)
+				// Continue even if Redis fails
+			}
 		}
 	}
 
@@ -923,6 +929,12 @@ func flushAndCheckCommitmentV3(ctx context.Context, header *types.Header, applyT
 		err = monitor.FlushData()
 		if err != nil {
 			return false, err
+		}
+		
+		// Finalize the block data
+		if err := monitor.FinishBlockProcessing(header.Number.Uint64()); err != nil {
+			logger.Warn("Failed to finalize block data in Redis", "block", header.Number.Uint64(), "err", err)
+			// Continue even if Redis fails
 		}
 	}
 
